@@ -62,6 +62,32 @@ def resolve_tier(view):
 # 역할군 목록
 ROLES = ["타격대", "척후대", "전략가", "감시자", "플렉스"]
 
+# 인증(기본설정 완료) 역할명 — 이 역할이 있어야 일반 채널이 열리도록 서버 권한을 설정
+VERIFIED_ROLE = "인증됨"
+
+# 인증 역할을 가져오거나 없으면 생성
+async def get_or_create_verified_role(guild):
+    role = discord.utils.get(guild.roles, name=VERIFIED_ROLE)
+    if role is None:
+        role = await guild.create_role(
+            name=VERIFIED_ROLE,
+            permissions=discord.Permissions.none()
+        )
+    return role
+
+# 인증(기본설정 완료) 역할 보유 여부
+def is_verified(member):
+    return any(r.name == VERIFIED_ROLE for r in member.roles)
+
+# 미인증자면 안내 후 차단 — 차단했으면 True 반환
+async def block_if_unverified(interaction):
+    if is_verified(interaction.user):
+        return False
+    await interaction.response.send_message(
+        "🔒 먼저 `/기본설정` 으로 등록을 완료해주세요!", ephemeral=True
+    )
+    return True
+
 # 기본설정 안내 문구 (입장 안내 / 전체 안내 공용)
 SETUP_GUIDE = (
     "👋 **발쫀잼 서버에 오신 걸 환영해요!**\n"
@@ -222,6 +248,8 @@ class RoleSelectView(TierRoleView):
 # 슬래시 명령어
 @bot.tree.command(name="역할설정", description="역할군과 티어를 설정합니다")
 async def set_role(interaction: discord.Interaction):
+    if await block_if_unverified(interaction):
+        return
     await interaction.response.send_message(
         "아래에서 역할군과 티어를 선택해주세요!",
         view=RoleSelectView(),
@@ -270,6 +298,11 @@ async def create_roles(interaction: discord.Interaction):
                 permissions=discord.Permissions.none()  # everyone 기본 권한
             )
             created.append(role_name)
+
+    # 인증 역할도 함께 생성 (없을 때만)
+    if VERIFIED_ROLE not in existing:
+        await guild.create_role(name=VERIFIED_ROLE, permissions=discord.Permissions.none())
+        created.append(VERIFIED_ROLE)
 
     if created:
         await interaction.followup.send(f"✅ {len(created)}개 역할 생성 완료!\n`{'`, `'.join(created)}`", ephemeral=True)
@@ -365,6 +398,43 @@ async def announce_setup_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
+@bot.tree.command(name="인증일괄적용", description="DB에 등록된 기존 멤버 전원에게 인증 역할을 부여합니다 (일회성)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def grant_verified(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    role = await get_or_create_verified_role(guild)
+
+    # DB에 등록된 모든 discord_id 한 번에 조회
+    registered = await asyncio.to_thread(
+        lambda: {doc.id for doc in db.collection("users").stream()}
+    )
+
+    granted, already, missing = 0, 0, 0
+    for uid in registered:
+        member = guild.get_member(int(uid))
+        if member is None:
+            missing += 1  # DB엔 있는데 서버엔 없는(나간) 멤버
+            continue
+        if role in member.roles:
+            already += 1
+            continue
+        await member.add_roles(role)
+        granted += 1
+
+    await interaction.followup.send(
+        f"✅ 인증 역할 일괄 적용 완료!\n"
+        f"🆕 부여: {granted}명 | ✔️ 이미 보유: {already}명 | ❓ 서버에 없음: {missing}명",
+        ephemeral=True
+    )
+
+@grant_verified.error
+async def grant_verified_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
 # ===== /기본설정 =====
 
 # 닉네임 자동 생성: "학번 이름 / 발로닉#태그" (디스코드 최대 32자)
@@ -418,9 +488,13 @@ class BasicSetupConfirmButton(discord.ui.Button):
             if role_role:
                 to_add.append(role_role)
 
+        # 기본설정 완료 → 인증 역할도 함께 부여 (없으면 생성)
+        verified = await get_or_create_verified_role(guild)
+        to_add.append(verified)
+
         # 닉네임 + 역할을 한 번의 호출로 적용 (닉네임 실패해도 역할은 적용되게 분리)
         new_nick = build_nickname(view.student_id, view.name, view.riot_id)
-        keep = [r for r in member.roles if r.name not in managed and not r.is_default()]
+        keep = [r for r in member.roles if r.name not in managed and r.name != VERIFIED_ROLE and not r.is_default()]
         nick_failed = False
         try:
             await member.edit(roles=keep + to_add, nick=new_nick)
@@ -520,6 +594,8 @@ class NicknameModal(discord.ui.Modal):
 
 @bot.tree.command(name="닉네임변경", description="디스코드 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
 async def change_nickname(interaction: discord.Interaction):
+    if await block_if_unverified(interaction):
+        return
     # 기존에 저장된 정보가 있으면 모달에 미리 채워줌
     doc = db.collection("users").document(str(interaction.user.id)).get()
     data = doc.to_dict() if doc.exists else {}
