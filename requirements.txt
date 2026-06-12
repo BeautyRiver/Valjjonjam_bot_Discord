@@ -1,0 +1,3 @@
+discord.py==2.7.1
+firebase-admin==7.4.0
+python-dotenv==1.2.2

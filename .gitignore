@@ -1,0 +1,13 @@
+# 비밀 파일 - 절대 커밋 금지
+.env
+serviceAccountKey.json
+
+# 파이썬
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 에디터/시스템
+.claude/
+.DS_Store
