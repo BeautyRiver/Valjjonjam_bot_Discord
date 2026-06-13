@@ -93,13 +93,11 @@ SETUP_GUIDE = (
     "👋 **발쫀잼 서버에 오신 걸 환영해요!**\n"
     "서버에서 `/기본설정` 을 입력해 **학번 · 이름 · 발로란트 닉네임 · 티어 · 역할군**을 등록해주세요.\n"
     "등록하면 역할과 닉네임이 자동으로 세팅됩니다! 🎮"
+    "등록하지 않으면 **채팅방·통화방 이용이 제한**됩니다."
 )
 
 # 필독-규칙 채널 ID (채널 우클릭 → ID 복사. 0이면 링크 생략)
 RULES_CHANNEL_ID = 1478315682503327824
-
-# 인증 채널 ID — 이 채널에선 /기본설정 등 슬래시 명령어만 허용, 일반 메시지는 자동 삭제
-VERIFY_CHANNEL_ID = 1515226909040967783
 
 # 규칙 채널 링크를 붙인 안내 문구 생성
 def build_setup_guide(guild=None):
@@ -125,21 +123,6 @@ async def on_member_join(member: discord.Member):
         channel = member.guild.system_channel
         if channel and channel.permissions_for(member.guild.me).send_messages:
             await channel.send(f"{member.mention}\n{guide}")
-
-# 인증 채널에 올라온 일반 메시지 자동 삭제 (슬래시 명령어는 인터랙션이라 여기 안 걸림)
-@bot.event
-async def on_message(message: discord.Message):
-    # 봇이 보낸 메시지/DM은 무시
-    if message.author.bot or message.guild is None:
-        return
-    # 인증 채널에서 사람이 친 일반 메시지는 즉시 삭제 (어드민은 제외)
-    if message.channel.id == VERIFY_CHANNEL_ID and not message.author.guild_permissions.administrator:
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass  # 봇에 '메시지 관리' 권한이 없으면 삭제 불가
-        return
-    await bot.process_commands(message)
 
 # 티어 선택 1단계 - 큰 티어
 class MajorTierSelect(discord.ui.Select):
@@ -449,6 +432,72 @@ async def grant_verified(interaction: discord.Interaction):
 
 @grant_verified.error
 async def grant_verified_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+@bot.tree.command(name="미인증안내", description="인증됨 역할이 없는 멤버 전원에게 기본설정 안내 DM을 보냅니다")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def announce_unverified(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    guide = build_setup_guide(guild)
+
+    sent, failed, skipped = 0, 0, 0
+    for member in guild.members:
+        if member.bot:
+            continue
+        if is_verified(member):  # 인증됨 역할 있으면 제외
+            skipped += 1
+            continue
+        try:
+            await member.send(guide)
+            sent += 1
+        except discord.Forbidden:
+            failed += 1  # DM 차단된 멤버
+
+    await interaction.followup.send(
+        f"📣 미인증자 안내 DM 전송 완료!\n"
+        f"✅ 보냄: {sent}명 | ⏭️ 이미 인증: {skipped}명 | ❌ DM 차단: {failed}명",
+        ephemeral=True
+    )
+
+@announce_unverified.error
+async def announce_unverified_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+@bot.tree.command(name="탈퇴정리", description="서버를 나간 멤버의 등록 정보를 DB에서 삭제합니다")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def cleanup_db(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # DB에 등록된 모든 discord_id 조회
+    registered = await asyncio.to_thread(
+        lambda: {doc.id for doc in db.collection("users").stream()}
+    )
+
+    # 서버에 더 이상 없는(나간) 멤버의 ID만 추림
+    gone = [uid for uid in registered if guild.get_member(int(uid)) is None]
+
+    # DB에서 한 번에 삭제
+    def delete_docs():
+        for uid in gone:
+            db.collection("users").document(uid).delete()
+    await asyncio.to_thread(delete_docs)
+
+    await interaction.followup.send(
+        f"🧹 DB 정리 완료!\n"
+        f"🗑️ 삭제: {len(gone)}명 | 👥 남은 등록: {len(registered) - len(gone)}명",
+        ephemeral=True
+    )
+
+@cleanup_db.error
+async def cleanup_db_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
