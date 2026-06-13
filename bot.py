@@ -98,6 +98,9 @@ SETUP_GUIDE = (
 # 필독-규칙 채널 ID (채널 우클릭 → ID 복사. 0이면 링크 생략)
 RULES_CHANNEL_ID = 1478315682503327824
 
+# 인증 채널 ID — 이 채널에선 /기본설정 등 슬래시 명령어만 허용, 일반 메시지는 자동 삭제
+VERIFY_CHANNEL_ID = 1515226909040967783
+
 # 규칙 채널 링크를 붙인 안내 문구 생성
 def build_setup_guide(guild=None):
     if RULES_CHANNEL_ID:
@@ -122,6 +125,21 @@ async def on_member_join(member: discord.Member):
         channel = member.guild.system_channel
         if channel and channel.permissions_for(member.guild.me).send_messages:
             await channel.send(f"{member.mention}\n{guide}")
+
+# 인증 채널에 올라온 일반 메시지 자동 삭제 (슬래시 명령어는 인터랙션이라 여기 안 걸림)
+@bot.event
+async def on_message(message: discord.Message):
+    # 봇이 보낸 메시지/DM은 무시
+    if message.author.bot or message.guild is None:
+        return
+    # 인증 채널에서 사람이 친 일반 메시지는 즉시 삭제 (어드민은 제외)
+    if message.channel.id == VERIFY_CHANNEL_ID and not message.author.guild_permissions.administrator:
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass  # 봇에 '메시지 관리' 권한이 없으면 삭제 불가
+        return
+    await bot.process_commands(message)
 
 # 티어 선택 1단계 - 큰 티어
 class MajorTierSelect(discord.ui.Select):
