@@ -92,8 +92,7 @@ async def block_if_unverified(interaction):
 SETUP_GUIDE = (
     "👋 **발쫀잼 서버에 오신 걸 환영해요!**\n"
     "서버에서 `/기본설정` 을 입력해 **학번 · 이름 · 발로란트 닉네임 · 티어 · 역할군**을 등록해주세요.\n"
-    "등록하면 역할과 닉네임이 자동으로 세팅됩니다! 🎮\n"
-    "등록하지 않으면 **채팅방·통화방 이용이 제한**됩니다."
+    "등록하면 역할과 닉네임이 자동으로 세팅됩니다! 🎮\n"    
 )
 
 # 필독-규칙 채널 ID (채널 우클릭 → ID 복사. 0이면 링크 생략)
@@ -104,6 +103,20 @@ def build_setup_guide(guild=None):
     if RULES_CHANNEL_ID:
         return SETUP_GUIDE + f"\n\n📜 먼저 <#{RULES_CHANNEL_ID}> 을(를) 꼭 확인해주세요!"
     return SETUP_GUIDE
+
+# 미인증자 재안내 문구 (서버에 있지만 아직 /기본설정 안 한 멤버용)
+UNVERIFIED_NOTICE = (
+    "📢 **발쫀잼 서버 이용 안내**\n"
+    "아직 `/기본설정` 등록을 완료하지 않으셨어요!\n"
+    "`/기본설정` 을 입력해 **학번 · 이름 · 발로란트 닉네임 · 티어 · 역할군**을 등록해주세요.\n"
+    "등록을 마치면 역할과 닉네임이 자동으로 세팅돼요. 🎮\n"
+)
+
+# 규칙 채널 링크를 붙인 미인증자 안내 문구 생성
+def build_unverified_notice(guild=None):
+    if RULES_CHANNEL_ID:
+        return UNVERIFIED_NOTICE + f"\n\n📜 먼저 <#{RULES_CHANNEL_ID}> 을(를) 꼭 확인해주세요!"
+    return UNVERIFIED_NOTICE
 
 @bot.event
 async def on_ready():
@@ -442,7 +455,7 @@ async def grant_verified_error(interaction: discord.Interaction, error):
 async def announce_unverified(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
-    guide = build_setup_guide(guild)
+    guide = build_unverified_notice(guild)
 
     sent, failed, skipped = 0, 0, 0
     for member in guild.members:
