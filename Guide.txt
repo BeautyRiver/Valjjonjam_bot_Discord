@@ -1,0 +1,16 @@
+서버 SSH 다시 여는 법
+  1. https://console.cloud.google.com/compute/instances 접속
+  2. valjjonjam-bot 줄의 SSH 버튼 클릭 → 검은 터미널 창 열림
+
+서버에서 — 새 코드 받고 봇 재시작
+
+  SSH 창에 아래 한 줄 붙여넣고 엔터:
+  cd ~/bot && git pull && sudo systemctl restart valjjonjam
+  이게:
+  - git pull → GitHub에서 방금 올린 새 코드 받기
+  - systemctl restart valjjonjam → 봇을 새 코드로 재시작
+
+ 잘 됐는지 확인
+
+  sudo systemctl status valjjonjam
+  → active (running) 뜨면 성공. 디스코드에서 봇 온라인인지도 한번 보세요.

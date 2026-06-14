@@ -1,0 +1,13 @@
+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
+--------------------------------------------------------------
+
+git remote set-url origin https://BeautyRiver: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@github.com/BeautyRiver/Valjjonjam_bot_Discord.git
+
+그다음 평소대로:
+
+cd ~/bot && git pull && sudo systemctl restart valjjonjam
+
+이러면 패스워드를 묻지 않고 바로 통과해요. (토큰이 URL에 들어가서 인증됨)
+
+확인:
+sudo systemctl status valjjonjam
