@@ -107,6 +107,26 @@ async def block_if_unverified(interaction):
     )
     return True
 
+# 대상(다른 멤버) 지정 시 관리자 권한·봇 여부를 확인.
+# 반환값: (적용 대상 멤버, 관리자모드 여부, 차단됨 여부)
+#  - 대상 미지정: (본인, False, False)
+#  - 대상 지정 + 관리자 OK: (대상, True, False)
+#  - 권한 없음/봇 대상: (None, False, True) → 호출부에서 즉시 return
+async def resolve_command_target(interaction, 대상):
+    if 대상 is None:
+        return interaction.user, False, False
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ 다른 멤버를 대신 설정하려면 **관리자 권한**이 필요해요!", ephemeral=True
+        )
+        return None, False, True
+    if 대상.bot:
+        await interaction.response.send_message(
+            "❌ 봇은 설정 대상이 될 수 없어요!", ephemeral=True
+        )
+        return None, False, True
+    return 대상, True, True
+
 # 기본설정 안내 문구 (입장 안내 / 전체 안내 공용)
 SETUP_GUIDE = (
     "👋 **발쫀잼 서버에 오신 걸 환영해요!**\n"
@@ -198,9 +218,11 @@ class RoleSelect(discord.ui.Select):
         self.view.selected_roles = self.values
 
 # 티어(2단계)+역할군 선택 공용 View — 확인 버튼만 갈아끼움
+# target: 역할/닉네임을 적용할 대상 멤버(관리자가 대신 설정할 때). None이면 명령어 실행자 본인
 class TierRoleView(discord.ui.View):
-    def __init__(self, confirm_item, timeout=120):
+    def __init__(self, confirm_item, target=None, timeout=120):
         super().__init__(timeout=timeout)
+        self.target = target
         self.major_tier = None
         self.division = None
         self.division_select = DivisionSelect()
@@ -238,7 +260,7 @@ class ConfirmButton(discord.ui.Button):
 
         await interaction.response.send_message("⏳ 적용 중...", ephemeral=True)
         guild = interaction.guild
-        member = interaction.user
+        member = view.target or interaction.user  # 관리자가 대신 설정 시 대상 멤버
 
         # 새로 부여할 티어/역할군 역할
         managed = set(TIERS + ROLES)
@@ -275,19 +297,23 @@ class ConfirmButton(discord.ui.Button):
 
 # 전체 View
 class RoleSelectView(TierRoleView):
-    def __init__(self):
-        super().__init__(ConfirmButton(), timeout=60)
+    def __init__(self, target=None):
+        super().__init__(ConfirmButton(), target=target, timeout=60)
 
 # 슬래시 명령어
 @bot.tree.command(name="역할설정", description="역할군과 티어를 설정합니다")
-async def set_role(interaction: discord.Interaction):
+@app_commands.describe(대상="(관리자 전용) 대신 설정해줄 멤버")
+async def set_role(interaction: discord.Interaction, 대상: discord.Member = None):
     if await block_if_not_in_guild(interaction):
         return
-    if await block_if_unverified(interaction):
+    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
+    if blocked:
+        return
+    if not admin_mode and await block_if_unverified(interaction):
         return
     await interaction.response.send_message(
         "아래에서 역할군과 티어를 선택해주세요!",
-        view=RoleSelectView(),
+        view=RoleSelectView(target),
         ephemeral=True
     )
 
@@ -552,10 +578,14 @@ class BasicSetupModal(discord.ui.Modal, title="기본 설정"):
         max_length=30
     )
 
+    def __init__(self, target=None):
+        super().__init__()
+        self.target = target  # 관리자가 대신 설정할 대상 멤버
+
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             "마지막으로 티어와 역할군을 선택한 뒤 확인을 눌러주세요!",
-            view=BasicSetupView(str(self.student_id), str(self.name), str(self.riot_id)),
+            view=BasicSetupView(str(self.student_id), str(self.name), str(self.riot_id), self.target),
             ephemeral=True
         )
 
@@ -576,7 +606,7 @@ class BasicSetupConfirmButton(discord.ui.Button):
 
         await interaction.response.send_message("⏳ 적용 중...", ephemeral=True)
         guild = interaction.guild
-        member = interaction.user
+        member = view.target or interaction.user  # 관리자가 대신 설정 시 대상 멤버
 
         # 새로 부여할 티어/역할군 역할
         managed = set(TIERS + ROLES)
@@ -651,25 +681,30 @@ class BasicSetupConfirmButton(discord.ui.Button):
 
 # 2단계 View (모달 입력값을 들고 다님)
 class BasicSetupView(TierRoleView):
-    def __init__(self, student_id, name, riot_id):
-        super().__init__(BasicSetupConfirmButton(), timeout=120)
+    def __init__(self, student_id, name, riot_id, target=None):
+        super().__init__(BasicSetupConfirmButton(), target=target, timeout=120)
         self.student_id = student_id
         self.name = name
         self.riot_id = riot_id
 
 @bot.tree.command(name="기본설정", description="학번/이름/발로란트 닉네임과 티어·역할군을 설정합니다")
-async def basic_setup(interaction: discord.Interaction):
+@app_commands.describe(대상="(관리자 전용) 대신 설정해줄 멤버")
+async def basic_setup(interaction: discord.Interaction, 대상: discord.Member = None):
     if await block_if_not_in_guild(interaction):
         return
-    await interaction.response.send_modal(BasicSetupModal())
+    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
+    if blocked:
+        return
+    await interaction.response.send_modal(BasicSetupModal(target))
 
 
 # ===== /닉네임변경 =====
 
 # 학번/이름/발로닉만 받아 디스코드 닉네임을 "학번 이름 / 발로닉" 으로 변경
 class NicknameModal(discord.ui.Modal):
-    def __init__(self, student_id="", name="", riot_id=""):
+    def __init__(self, target, student_id="", name="", riot_id=""):
         super().__init__(title="닉네임 변경")
+        self.target = target  # 닉네임을 바꿀 대상 멤버(관리자가 대신 변경 시)
         self.student_id = discord.ui.TextInput(
             label="학번", placeholder="예: 21", default=student_id, max_length=10
         )
@@ -685,7 +720,7 @@ class NicknameModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.send_message("⏳ 적용 중...", ephemeral=True)
-        member = interaction.user
+        member = self.target  # 관리자가 대신 변경 시 대상 멤버
         sid, nm, rid = str(self.student_id), str(self.name), str(self.riot_id)
         new_nick = build_nickname(sid, nm, rid)
 
@@ -717,15 +752,20 @@ class NicknameModal(discord.ui.Modal):
             await interaction.edit_original_response(content=f"✅ 닉네임을 `{new_nick}` (으)로 변경했어요!")
 
 @bot.tree.command(name="닉네임변경", description="디스코드 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
-async def change_nickname(interaction: discord.Interaction):
+@app_commands.describe(대상="(관리자 전용) 대신 닉네임을 바꿔줄 멤버")
+async def change_nickname(interaction: discord.Interaction, 대상: discord.Member = None):
     if await block_if_not_in_guild(interaction):
         return
-    if await block_if_unverified(interaction):
+    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
+    if blocked:
         return
-    # 기존에 저장된 정보가 있으면 모달에 미리 채워줌
-    doc = db.collection("users").document(str(interaction.user.id)).get()
+    if not admin_mode and await block_if_unverified(interaction):
+        return
+    # 기존에 저장된 (대상의) 정보가 있으면 모달에 미리 채워줌
+    doc = db.collection("users").document(str(target.id)).get()
     data = doc.to_dict() if doc.exists else {}
     await interaction.response.send_modal(NicknameModal(
+        target,
         data.get("student_id", ""),
         data.get("name", ""),
         data.get("riot_id", ""),
