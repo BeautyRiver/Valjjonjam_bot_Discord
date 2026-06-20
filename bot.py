@@ -107,25 +107,14 @@ async def block_if_unverified(interaction):
     )
     return True
 
-# 대상(다른 멤버) 지정 시 관리자 권한·봇 여부를 확인.
-# 반환값: (적용 대상 멤버, 관리자모드 여부, 차단됨 여부)
-#  - 대상 미지정: (본인, False, False)
-#  - 대상 지정 + 관리자 OK: (대상, True, False)
-#  - 권한 없음/봇 대상: (None, False, True) → 호출부에서 즉시 return
-async def resolve_command_target(interaction, 대상):
-    if 대상 is None:
-        return interaction.user, False, False
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ 다른 멤버를 대신 설정하려면 **관리자 권한**이 필요해요!", ephemeral=True
-        )
-        return None, False, True
+# 관리자 대리 명령어 공통: 대상이 봇이면 안내 후 차단 — 차단했으면 True 반환
+async def block_if_bot_target(interaction, 대상):
     if 대상.bot:
         await interaction.response.send_message(
             "❌ 봇은 설정 대상이 될 수 없어요!", ephemeral=True
         )
-        return None, False, True
-    return 대상, True, False
+        return True
+    return False
 
 # 기본설정 안내 문구 (입장 안내 / 전체 안내 공용)
 SETUP_GUIDE = (
@@ -302,18 +291,14 @@ class RoleSelectView(TierRoleView):
 
 # 슬래시 명령어
 @bot.tree.command(name="역할설정", description="역할군과 티어를 설정합니다")
-@app_commands.describe(대상="(관리자 전용) 대신 설정해줄 멤버")
-async def set_role(interaction: discord.Interaction, 대상: discord.Member = None):
+async def set_role(interaction: discord.Interaction):
     if await block_if_not_in_guild(interaction):
         return
-    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
-    if blocked:
-        return
-    if not admin_mode and await block_if_unverified(interaction):
+    if await block_if_unverified(interaction):
         return
     await interaction.response.send_message(
         "아래에서 역할군과 티어를 선택해주세요!",
-        view=RoleSelectView(target),
+        view=RoleSelectView(),
         ephemeral=True
     )
 
@@ -411,50 +396,33 @@ async def delete_roles_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
-@bot.tree.command(name="전체안내", description="아직 등록 안 한 멤버 전원에게 기본설정 안내 DM을 보냅니다")
-@app_commands.describe(테스트="나에게만 미리 보내보기 (기본: 전체 발송)")
+@bot.tree.command(name="메세지", description="봇이 현재 채널에 임베드 메세지를 보냅니다")
+@app_commands.describe(
+    내용="보낼 내용 (줄바꿈은 \\n 으로 입력)",
+    제목="임베드 제목 (선택)",
+    미리보기="True면 나에게만 보여요 (전송 전 확인용)",
+)
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def announce_setup(interaction: discord.Interaction, 테스트: bool = False):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    guide = build_setup_guide(guild)
+async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = None, 미리보기: bool = False):
+    # 슬래시 입력은 줄바꿈을 못 넣으니 \n 표기를 실제 줄바꿈으로 변환
+    embed = discord.Embed(description=내용.replace("\\n", "\n"), color=discord.Color.blurple())
+    if 제목:
+        embed.title = 제목
 
-    # 디버그: 나에게만 보내보기
-    if 테스트:
-        try:
-            await interaction.user.send(guide)
-            await interaction.followup.send("🧪 테스트: 본인에게만 안내 DM을 보냈어요!", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("❌ 본인 DM이 막혀있어 못 보냈어요. DM 허용 후 다시 시도해주세요.", ephemeral=True)
+    # 미리보기(디버그): 채널에 안 보내고 나에게만 보여줌
+    if 미리보기:
+        await interaction.response.send_message(
+            content="🧪 **미리보기** — 아직 채널에 전송되지 않았어요!",
+            embed=embed, ephemeral=True
+        )
         return
 
-    # 이미 /기본설정 한 멤버는 제외 (DB에 등록된 ID 한 번에 조회)
-    registered = await asyncio.to_thread(
-        lambda: {doc.id for doc in db.collection("users").stream()}
-    )
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("✅ 메세지를 보냈어요!", ephemeral=True)
 
-    sent, failed, skipped = 0, 0, 0
-    for member in guild.members:
-        if member.bot:
-            continue
-        if str(member.id) in registered:
-            skipped += 1
-            continue
-        try:
-            await member.send(guide)
-            sent += 1
-        except discord.Forbidden:
-            failed += 1  # DM 차단된 멤버
-
-    await interaction.followup.send(
-        f"📣 안내 DM 전송 완료!\n"
-        f"✅ 보냄: {sent}명 | ⏭️ 이미 등록: {skipped}명 | ❌ DM 차단: {failed}명",
-        ephemeral=True
-    )
-
-@announce_setup.error
-async def announce_setup_error(interaction: discord.Interaction, error):
+@bot_say.error
+async def bot_say_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
@@ -688,14 +656,10 @@ class BasicSetupView(TierRoleView):
         self.riot_id = riot_id
 
 @bot.tree.command(name="기본설정", description="학번/이름/발로란트 닉네임과 티어·역할군을 설정합니다")
-@app_commands.describe(대상="(관리자 전용) 대신 설정해줄 멤버")
-async def basic_setup(interaction: discord.Interaction, 대상: discord.Member = None):
+async def basic_setup(interaction: discord.Interaction):
     if await block_if_not_in_guild(interaction):
         return
-    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
-    if blocked:
-        return
-    await interaction.response.send_modal(BasicSetupModal(target))
+    await interaction.response.send_modal(BasicSetupModal())
 
 
 # ===== /닉네임변경 =====
@@ -752,24 +716,81 @@ class NicknameModal(discord.ui.Modal):
             await interaction.edit_original_response(content=f"✅ 닉네임을 `{new_nick}` (으)로 변경했어요!")
 
 @bot.tree.command(name="닉네임변경", description="디스코드 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
-@app_commands.describe(대상="(관리자 전용) 대신 닉네임을 바꿔줄 멤버")
-async def change_nickname(interaction: discord.Interaction, 대상: discord.Member = None):
+async def change_nickname(interaction: discord.Interaction):
     if await block_if_not_in_guild(interaction):
         return
-    target, admin_mode, blocked = await resolve_command_target(interaction, 대상)
-    if blocked:
+    if await block_if_unverified(interaction):
         return
-    if not admin_mode and await block_if_unverified(interaction):
-        return
-    # 기존에 저장된 (대상의) 정보가 있으면 모달에 미리 채워줌
-    doc = db.collection("users").document(str(target.id)).get()
+    # 기존에 저장된 정보가 있으면 모달에 미리 채워줌
+    doc = db.collection("users").document(str(interaction.user.id)).get()
     data = doc.to_dict() if doc.exists else {}
     await interaction.response.send_modal(NicknameModal(
-        target,
+        interaction.user,
         data.get("student_id", ""),
         data.get("name", ""),
         data.get("riot_id", ""),
     ))
+
+
+# ===== 관리자 대리 설정 =====
+# 본인 명령어(기본설정/역할설정/닉네임변경)와 동일한 View/Modal을 쓰되
+# 대상 멤버를 넣어 그 사람에게 적용. 어드민에게만 디스코드 UI에 노출됨.
+
+@bot.tree.command(name="대리기본설정", description="(어드민) 다른 멤버의 학번·이름·발로닉·티어·역할군을 대신 등록합니다")
+@app_commands.describe(대상="설정해줄 멤버")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_basic_setup(interaction: discord.Interaction, 대상: discord.Member):
+    if await block_if_bot_target(interaction, 대상):
+        return
+    await interaction.response.send_modal(BasicSetupModal(대상))
+
+@admin_basic_setup.error
+async def admin_basic_setup_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+@bot.tree.command(name="대리역할설정", description="(어드민) 다른 멤버의 역할군·티어를 대신 설정합니다")
+@app_commands.describe(대상="설정해줄 멤버")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_set_role(interaction: discord.Interaction, 대상: discord.Member):
+    if await block_if_bot_target(interaction, 대상):
+        return
+    await interaction.response.send_message(
+        f"**{대상.display_name}** 님의 역할군과 티어를 선택해주세요!",
+        view=RoleSelectView(대상),
+        ephemeral=True
+    )
+
+@admin_set_role.error
+async def admin_set_role_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+@bot.tree.command(name="대리닉네임변경", description="(어드민) 다른 멤버의 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
+@app_commands.describe(대상="닉네임을 바꿔줄 멤버")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_change_nickname(interaction: discord.Interaction, 대상: discord.Member):
+    if await block_if_bot_target(interaction, 대상):
+        return
+    # 대상에게 저장된 정보가 있으면 모달에 미리 채워줌
+    doc = db.collection("users").document(str(대상.id)).get()
+    data = doc.to_dict() if doc.exists else {}
+    await interaction.response.send_modal(NicknameModal(
+        대상,
+        data.get("student_id", ""),
+        data.get("name", ""),
+        data.get("riot_id", ""),
+    ))
+
+@admin_change_nickname.error
+async def admin_change_nickname_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
 bot.run(TOKEN)
