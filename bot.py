@@ -87,6 +87,17 @@ async def get_or_create_verified_role(guild):
 def is_verified(member):
     return any(r.name == VERIFIED_ROLE for r in member.roles)
 
+# DM 등 서버 밖에서 쓰면 안내 후 차단 — 차단했으면 True 반환
+async def block_if_not_in_guild(interaction):
+    if interaction.guild is not None:
+        return False
+    await interaction.response.send_message(
+        "⚠️ 이 명령어는 **서버 채널 안에서** 사용해주세요!\n"
+        "봇과의 개인 DM(1:1 채팅)에서는 역할·닉네임을 설정할 수 없어요. 발쫀잼 서버로 가서 다시 입력해주세요.",
+        ephemeral=True
+    )
+    return True
+
 # 미인증자면 안내 후 차단 — 차단했으면 True 반환
 async def block_if_unverified(interaction):
     if is_verified(interaction.user):
@@ -265,11 +276,13 @@ class ConfirmButton(discord.ui.Button):
 # 전체 View
 class RoleSelectView(TierRoleView):
     def __init__(self):
-        super().__init__(ConfirmButton(), timeout=300)
+        super().__init__(ConfirmButton(), timeout=60)
 
 # 슬래시 명령어
 @bot.tree.command(name="역할설정", description="역할군과 티어를 설정합니다")
 async def set_role(interaction: discord.Interaction):
+    if await block_if_not_in_guild(interaction):
+        return
     if await block_if_unverified(interaction):
         return
     await interaction.response.send_message(
@@ -639,13 +652,15 @@ class BasicSetupConfirmButton(discord.ui.Button):
 # 2단계 View (모달 입력값을 들고 다님)
 class BasicSetupView(TierRoleView):
     def __init__(self, student_id, name, riot_id):
-        super().__init__(BasicSetupConfirmButton(), timeout=300)
+        super().__init__(BasicSetupConfirmButton(), timeout=120)
         self.student_id = student_id
         self.name = name
         self.riot_id = riot_id
 
 @bot.tree.command(name="기본설정", description="학번/이름/발로란트 닉네임과 티어·역할군을 설정합니다")
 async def basic_setup(interaction: discord.Interaction):
+    if await block_if_not_in_guild(interaction):
+        return
     await interaction.response.send_modal(BasicSetupModal())
 
 
@@ -703,6 +718,8 @@ class NicknameModal(discord.ui.Modal):
 
 @bot.tree.command(name="닉네임변경", description="디스코드 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
 async def change_nickname(interaction: discord.Interaction):
+    if await block_if_not_in_guild(interaction):
+        return
     if await block_if_unverified(interaction):
         return
     # 기존에 저장된 정보가 있으면 모달에 미리 채워줌
