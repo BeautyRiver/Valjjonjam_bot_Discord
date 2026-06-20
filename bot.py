@@ -125,7 +125,7 @@ async def resolve_command_target(interaction, 대상):
             "❌ 봇은 설정 대상이 될 수 없어요!", ephemeral=True
         )
         return None, False, True
-    return 대상, True, True
+    return 대상, True, False
 
 # 기본설정 안내 문구 (입장 안내 / 전체 안내 공용)
 SETUP_GUIDE = (
