@@ -6,6 +6,14 @@ from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 import os
 import asyncio
+import logging
+
+# 로깅 설정 (실패 원인을 콘솔에 자세히 남김)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("valjjonjam")
 
 # 환경변수 로드
 load_dotenv()
@@ -257,7 +265,7 @@ class ConfirmButton(discord.ui.Button):
 # 전체 View
 class RoleSelectView(TierRoleView):
     def __init__(self):
-        super().__init__(ConfirmButton(), timeout=60)
+        super().__init__(ConfirmButton(), timeout=300)
 
 # 슬래시 명령어
 @bot.tree.command(name="역할설정", description="역할군과 티어를 설정합니다")
@@ -572,24 +580,45 @@ class BasicSetupConfirmButton(discord.ui.Button):
         verified = await get_or_create_verified_role(guild)
         to_add.append(verified)
 
-        # 닉네임 + 역할을 한 번의 호출로 적용 (닉네임 실패해도 역할은 적용되게 분리)
-        new_nick = build_nickname(view.student_id, view.name, view.riot_id)
-        keep = [r for r in member.roles if r.name not in managed and r.name != VERIFIED_ROLE and not r.is_default()]
-        nick_failed = False
+        # ① 역할(인증)을 먼저·따로 부여 — 닉네임이 막혀도 인증은 무조건 되게
+        #    add/remove로 처리하면 봇보다 위 역할을 가진 멤버에게도 영향을 덜 받음
+        managed_all = managed | {VERIFIED_ROLE}
+        to_remove = [r for r in member.roles if r.name in managed_all and r not in to_add]
+        role_failed = None
         try:
-            await member.edit(roles=keep + to_add, nick=new_nick)
-        except discord.Forbidden:
-            # 닉네임 권한 문제일 수 있으니 역할만 따로 적용
-            nick_failed = True
-            await member.edit(roles=keep + to_add)
+            if to_remove:
+                await member.remove_roles(*to_remove)
+            await member.add_roles(*to_add)
+        except discord.HTTPException as e:
+            role_failed = e
+            log.error(
+                "역할 적용 실패 — %s(%s) / 부여시도=%s / status=%s code=%s: %s",
+                member, member.id, [r.name for r in to_add],
+                getattr(e, "status", "?"), getattr(e, "code", "?"), e,
+            )
+
+        # ② 닉네임은 별도로 — 실패해도 인증은 통과 (Forbidden/HTTPException 모두 처리)
+        new_nick = build_nickname(view.student_id, view.name, view.riot_id)
+        nick_failed = None
+        try:
+            await member.edit(nick=new_nick)
+        except discord.HTTPException as e:
+            nick_failed = e
+            log.error(
+                "닉네임 변경 실패 — %s(%s) / 닉='%s' / status=%s code=%s: %s",
+                member, member.id, new_nick,
+                getattr(e, "status", "?"), getattr(e, "code", "?"), e,
+            )
 
         msg = (
             f"✅ **{view.name}** 님 설정 완료!\n"
             f"학번: `{view.student_id}` | 발로ID: `{view.riot_id}`\n"
             f"티어: `{tier}` | 역할군: `{', '.join(view.selected_roles)}`"
         )
+        if role_failed:
+            msg += "\n⚠️ 일부 역할을 적용하지 못했어요. (봇에 '역할 관리' 권한을 주고 봇 역할을 위로 올려주세요)"
         if nick_failed:
-            msg += "\n⚠️ 닉네임 변경 권한이 없어 닉네임은 바꾸지 못했어요. (봇 역할을 멤버보다 위로 올리고 '닉네임 관리' 권한을 주세요)"
+            msg += "\n⚠️ 닉네임은 바꾸지 못했어요. (이름·발로 닉네임에 `@`, `discord`, `clyde`, `everyone`, `here` 같은 단어가 들어가면 디스코드가 막아요. `/닉네임변경` 으로 다시 시도해보세요)"
         await interaction.edit_original_response(content=msg)
 
         # Firestore 저장은 응답 후 백그라운드에서 (이벤트 루프 차단 방지)
@@ -610,7 +639,7 @@ class BasicSetupConfirmButton(discord.ui.Button):
 # 2단계 View (모달 입력값을 들고 다님)
 class BasicSetupView(TierRoleView):
     def __init__(self, student_id, name, riot_id):
-        super().__init__(BasicSetupConfirmButton(), timeout=120)
+        super().__init__(BasicSetupConfirmButton(), timeout=300)
         self.student_id = student_id
         self.name = name
         self.riot_id = riot_id
