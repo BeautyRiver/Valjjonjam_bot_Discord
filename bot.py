@@ -1,12 +1,14 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1 import transactional
 from dotenv import load_dotenv
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 # 로깅 설정 (실패 원인을 콘솔에 자세히 남김)
 logging.basicConfig(
@@ -72,6 +74,15 @@ ROLES = ["타격대", "척후대", "전략가", "감시자", "플렉스"]
 
 # 인증(기본설정 완료) 역할명 — 이 역할이 있어야 일반 채널이 열리도록 서버 권한을 설정
 VERIFIED_ROLE = "인증됨"
+
+# 파티 모집 설정
+PARTY_COLLECTION = "parties"
+GUILD_SETTINGS_COLLECTION = "guild_settings"
+PARTY_MAX_MEMBERS = 5
+PARTY_TIMEZONE = timezone(timedelta(hours=9))
+PARTY_MIN_LEAD = timedelta(minutes=10)
+PARTY_MAX_LEAD = timedelta(hours=24)
+PARTY_DELETE_DELAY = timedelta(hours=10)
 
 # 인증 역할을 가져오거나 없으면 생성
 async def get_or_create_verified_role(guild):
@@ -148,6 +159,12 @@ def build_unverified_notice(guild=None):
 
 @bot.event
 async def on_ready():
+    # 재시작 후에도 기존 파티 모집글의 버튼이 계속 동작하도록 영구 View 등록
+    if not getattr(bot, "party_view_registered", False):
+        bot.add_view(PartyView())
+        bot.party_view_registered = True
+    if not cleanup_parties.is_running():
+        cleanup_parties.start()
     await bot.tree.sync()
     print(f"{bot.user} 온라인!")
 
@@ -791,6 +808,554 @@ async def admin_change_nickname(interaction: discord.Interaction, 대상: discor
 async def admin_change_nickname_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+# ===== 5인 파티 모집 =====
+
+party_action_lock = asyncio.Lock()
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def parse_party_time(value):
+    try:
+        local_time = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=PARTY_TIMEZONE)
+    except ValueError:
+        return None, "❌ 시작시간은 `2026-07-17 22:00`처럼 `YYYY-MM-DD HH:mm` 형식으로 입력해주세요."
+
+    now_local = datetime.now(PARTY_TIMEZONE)
+    if local_time < now_local + PARTY_MIN_LEAD:
+        return None, "❌ 시작시간은 현재 시각보다 최소 10분 이후여야 해요."
+    if local_time > now_local + PARTY_MAX_LEAD:
+        return None, "❌ 시작시간은 현재부터 24시간 이내로 정해주세요."
+    return local_time.astimezone(timezone.utc), None
+
+
+def party_status(data, now=None):
+    now = now or utc_now()
+    scheduled_at = as_utc(data.get("scheduled_at"))
+    if scheduled_at is None or now >= scheduled_at:
+        return "closed"
+    if len(data.get("member_ids", [])) >= PARTY_MAX_MEMBERS:
+        return "full"
+    return "open"
+
+
+def build_party_embed(data):
+    status = party_status(data)
+    status_text = {
+        "open": "🟢 모집 중",
+        "full": "🔴 모집 완료",
+        "closed": "⚫ 모집 마감",
+    }[status]
+    color = {
+        "open": discord.Color.green(),
+        "full": discord.Color.red(),
+        "closed": discord.Color.dark_grey(),
+    }[status]
+
+    member_ids = [str(uid) for uid in data.get("member_ids", [])]
+    creator_id = str(data.get("creator_id", ""))
+    member_lines = []
+    for index in range(PARTY_MAX_MEMBERS):
+        if index < len(member_ids):
+            user_id = member_ids[index]
+            owner = " 👑" if user_id == creator_id else ""
+            member_lines.append(f"{index + 1}. <@{user_id}>{owner}")
+        else:
+            member_lines.append(f"{index + 1}. *모집 중*")
+
+    scheduled_at = as_utc(data["scheduled_at"])
+    delete_at = as_utc(data.get("delete_at")) or scheduled_at + PARTY_DELETE_DELAY
+    scheduled_timestamp = int(scheduled_at.timestamp())
+    delete_timestamp = int(delete_at.timestamp())
+
+    embed = discord.Embed(
+        title=f"🎮 {data['name']}",
+        description="\n".join(member_lines),
+        color=color,
+    )
+    embed.add_field(name="상태", value=status_text, inline=True)
+    embed.add_field(
+        name="현재 인원",
+        value=f"**{len(member_ids)} / {PARTY_MAX_MEMBERS}**",
+        inline=True,
+    )
+    embed.add_field(name="파티장", value=f"<@{creator_id}>", inline=True)
+    embed.add_field(
+        name="내전 시작",
+        value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
+        inline=False,
+    )
+    embed.add_field(
+        name="자동 삭제",
+        value=f"<t:{delete_timestamp}:F>\n내전 시작 10시간 후 자동으로 삭제됩니다.",
+        inline=False,
+    )
+    embed.set_footer(text="한 사람은 동시에 하나의 파티에만 참가할 수 있습니다.")
+    return embed
+
+
+class PartyView(discord.ui.View):
+    def __init__(self, data=None):
+        super().__init__(timeout=None)
+        if data is not None:
+            status = party_status(data)
+            self.join_party.disabled = status != "open"
+            self.leave_party.disabled = status == "closed"
+
+    @discord.ui.button(
+        label="참가하기",
+        style=discord.ButtonStyle.success,
+        custom_id="party:join",
+    )
+    async def join_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+        if await block_if_unverified(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        party_id = str(interaction.message.id)
+        user_id = str(interaction.user.id)
+
+        try:
+            async with party_action_lock:
+                other = await find_active_party_for_member(
+                    str(interaction.guild.id), user_id, exclude_party_id=party_id
+                )
+                if other is not None:
+                    await interaction.followup.send(
+                        "❌ 이미 다른 파티에 참가 중이에요. 기존 파티에서 참가 취소 후 다시 시도해주세요.",
+                        ephemeral=True,
+                    )
+                    return
+
+                party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    join_party_transaction, transaction, party_ref, user_id, utc_now()
+                )
+
+            messages = {
+                "missing": "❌ 이미 삭제된 파티예요.",
+                "closed": "❌ 모집이 마감된 파티예요.",
+                "full": "❌ 이미 5명이 모두 모였어요.",
+                "already": "ℹ️ 이미 이 파티에 참가하고 있어요.",
+                "joined": "✅ 파티에 참가했어요!",
+            }
+            if result == "joined":
+                await interaction.message.edit(embed=build_party_embed(data), view=PartyView(data))
+            await interaction.followup.send(messages[result], ephemeral=True)
+        except Exception:
+            log.exception("파티 참가 처리 실패 — party=%s user=%s", party_id, user_id)
+            await interaction.followup.send("❌ 파티 참가 처리 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="참가 취소",
+        style=discord.ButtonStyle.secondary,
+        custom_id="party:leave",
+    )
+    async def leave_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        party_id = str(interaction.message.id)
+        user_id = str(interaction.user.id)
+
+        try:
+            async with party_action_lock:
+                party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    leave_party_transaction, transaction, party_ref, user_id, utc_now()
+                )
+
+            messages = {
+                "missing": "❌ 이미 삭제된 파티예요.",
+                "closed": "❌ 이미 모집이 마감됐어요.",
+                "creator": "❌ 파티장은 참가를 취소할 수 없어요. `파티 삭제`를 이용해주세요.",
+                "not_member": "ℹ️ 이 파티에 참가하고 있지 않아요.",
+                "left": "✅ 파티 참가를 취소했어요.",
+            }
+            if result == "left":
+                await interaction.message.edit(embed=build_party_embed(data), view=PartyView(data))
+            await interaction.followup.send(messages[result], ephemeral=True)
+        except Exception:
+            log.exception("파티 참가 취소 실패 — party=%s user=%s", party_id, user_id)
+            await interaction.followup.send("❌ 참가 취소 처리 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="파티 삭제",
+        style=discord.ButtonStyle.danger,
+        custom_id="party:delete",
+    )
+    async def delete_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        party_id = str(interaction.message.id)
+        party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+
+        try:
+            data = await asyncio.to_thread(get_party_data, party_id)
+            if data is None:
+                await interaction.followup.send("❌ 이미 삭제된 파티예요.", ephemeral=True)
+                return
+
+            is_creator = str(interaction.user.id) == str(data.get("creator_id"))
+            is_admin = interaction.user.guild_permissions.administrator
+            if not is_creator and not is_admin:
+                await interaction.followup.send(
+                    "❌ 파티장 또는 관리자만 이 파티를 삭제할 수 있어요.", ephemeral=True
+                )
+                return
+
+            async with party_action_lock:
+                try:
+                    await interaction.message.delete()
+                except discord.NotFound:
+                    pass
+                await asyncio.to_thread(party_ref.delete)
+            await interaction.followup.send("🗑️ 파티 모집글을 삭제했어요.", ephemeral=True)
+        except Exception:
+            log.exception("파티 삭제 실패 — party=%s", party_id)
+            await interaction.followup.send("❌ 파티 삭제 중 오류가 발생했어요.", ephemeral=True)
+
+
+def get_party_data(party_id):
+    snapshot = db.collection(PARTY_COLLECTION).document(str(party_id)).get()
+    return snapshot.to_dict() if snapshot.exists else None
+
+
+def list_parties():
+    return [(doc.id, doc.to_dict()) for doc in db.collection(PARTY_COLLECTION).stream()]
+
+
+async def find_active_party_for_member(guild_id, user_id, exclude_party_id=None):
+    parties = await asyncio.to_thread(list_parties)
+    now = utc_now()
+    for party_id, data in parties:
+        if party_id == exclude_party_id:
+            continue
+        if str(data.get("guild_id")) != str(guild_id):
+            continue
+        if str(user_id) not in [str(uid) for uid in data.get("member_ids", [])]:
+            continue
+        scheduled_at = as_utc(data.get("scheduled_at"))
+        if scheduled_at is not None and now < scheduled_at:
+            return party_id, data
+    return None
+
+
+@transactional
+def join_party_transaction(transaction, party_ref, user_id, now):
+    snapshot = party_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    if party_status(data, now) == "closed":
+        return "closed", data
+
+    member_ids = [str(uid) for uid in data.get("member_ids", [])]
+    if user_id in member_ids:
+        return "already", data
+    if len(member_ids) >= PARTY_MAX_MEMBERS:
+        return "full", data
+
+    member_ids.append(user_id)
+    data["member_ids"] = member_ids
+    data["status"] = "full" if len(member_ids) >= PARTY_MAX_MEMBERS else "open"
+    data["updated_at"] = now
+    transaction.update(
+        party_ref,
+        {
+            "member_ids": member_ids,
+            "status": data["status"],
+            "updated_at": now,
+        },
+    )
+    return "joined", data
+
+
+@transactional
+def leave_party_transaction(transaction, party_ref, user_id, now):
+    snapshot = party_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    if party_status(data, now) == "closed":
+        return "closed", data
+    if str(data.get("creator_id")) == user_id:
+        return "creator", data
+
+    member_ids = [str(uid) for uid in data.get("member_ids", [])]
+    if user_id not in member_ids:
+        return "not_member", data
+
+    member_ids.remove(user_id)
+    data["member_ids"] = member_ids
+    data["status"] = "open"
+    data["updated_at"] = now
+    transaction.update(
+        party_ref,
+        {
+            "member_ids": member_ids,
+            "status": "open",
+            "updated_at": now,
+        },
+    )
+    return "left", data
+
+
+def get_party_channel_id(guild_id):
+    snapshot = db.collection(GUILD_SETTINGS_COLLECTION).document(str(guild_id)).get()
+    if not snapshot.exists:
+        return None
+    return snapshot.to_dict().get("party_channel_id")
+
+
+@bot.tree.command(name="파티채널설정", description="(어드민) 파티 모집 명령어를 사용할 채널을 지정합니다")
+@app_commands.describe(채널="파티 모집 전용 채널")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configure_party_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if await block_if_not_in_guild(interaction):
+        return
+
+    permissions = 채널.permissions_for(interaction.guild.me)
+    required = (
+        permissions.view_channel
+        and permissions.send_messages
+        and permissions.embed_links
+        and permissions.read_message_history
+    )
+    if not required:
+        await interaction.response.send_message(
+            "❌ 봇에게 선택한 채널의 `채널 보기`, `메시지 보내기`, `링크 첨부`, "
+            "`메시지 기록 보기` 권한을 모두 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await asyncio.to_thread(
+        db.collection(GUILD_SETTINGS_COLLECTION).document(str(interaction.guild.id)).set,
+        {
+            "party_channel_id": str(채널.id),
+            "updated_by": str(interaction.user.id),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    await interaction.followup.send(
+        f"✅ 파티 모집 채널을 {채널.mention}(으)로 설정했어요.\n"
+        "이제 `/파티생성`은 이 채널에서만 사용할 수 있습니다.",
+        ephemeral=True,
+    )
+
+
+@configure_party_channel.error
+async def configure_party_channel_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+@bot.tree.command(name="파티생성", description="5인 파티 모집글을 생성합니다")
+@app_commands.describe(
+    파티이름="파티 이름 (최대 30자)",
+    시작시간="한국시간 기준 YYYY-MM-DD HH:mm (현재부터 24시간 이내)",
+)
+async def create_party(
+    interaction: discord.Interaction,
+    파티이름: app_commands.Range[str, 1, 30],
+    시작시간: str,
+):
+    if await block_if_not_in_guild(interaction):
+        return
+    if await block_if_unverified(interaction):
+        return
+
+    name = 파티이름.strip()
+    if not name:
+        await interaction.response.send_message("❌ 파티 이름을 입력해주세요.", ephemeral=True)
+        return
+
+    scheduled_at, error = parse_party_time(시작시간)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    channel_id = await asyncio.to_thread(get_party_channel_id, interaction.guild.id)
+    if channel_id is None:
+        await interaction.followup.send(
+            "❌ 파티 모집 채널이 아직 설정되지 않았어요. "
+            "관리자가 `/파티채널설정`을 먼저 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.guild.get_channel(int(channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            "❌ 설정된 파티 모집 채널을 찾을 수 없어요. "
+            "관리자가 `/파티채널설정`으로 다시 지정해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.channel_id != channel.id:
+        await interaction.followup.send(
+            f"❌ `/파티생성`은 지정된 파티 모집 채널 {channel.mention}에서만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return
+
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not permissions.send_messages or not permissions.embed_links:
+        await interaction.followup.send(
+            f"❌ 봇에게 {channel.mention} 채널의 메시지 전송 및 링크 첨부 권한을 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    creator_id = str(interaction.user.id)
+
+    try:
+        async with party_action_lock:
+            active = await find_active_party_for_member(str(interaction.guild.id), creator_id)
+            if active is not None:
+                await interaction.followup.send(
+                    "❌ 이미 참가 중인 파티가 있어요. 기존 파티에서 나오거나 파티를 삭제한 뒤 다시 만들어주세요.",
+                    ephemeral=True,
+                )
+                return
+
+            now = utc_now()
+            data = {
+                "name": name,
+                "creator_id": creator_id,
+                "member_ids": [creator_id],
+                "guild_id": str(interaction.guild.id),
+                "channel_id": str(channel.id),
+                "scheduled_at": scheduled_at,
+                "delete_at": scheduled_at + PARTY_DELETE_DELAY,
+                "created_at": now,
+                "updated_at": now,
+                "status": "open",
+            }
+
+            message = await channel.send(embed=build_party_embed(data))
+            data["message_id"] = str(message.id)
+            party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
+            try:
+                await asyncio.to_thread(party_ref.set, data)
+                await message.edit(embed=build_party_embed(data), view=PartyView(data))
+            except Exception:
+                await asyncio.to_thread(party_ref.delete)
+                try:
+                    await message.delete()
+                except discord.NotFound:
+                    pass
+                raise
+
+        await interaction.followup.send(
+            f"✅ 파티 모집글을 만들었어요! {message.jump_url}\n"
+            "모집은 시작시간에 마감되고, 시작시간 10시간 후 자동 삭제됩니다.",
+            ephemeral=True,
+        )
+    except Exception:
+        log.exception("파티 생성 실패 — creator=%s", creator_id)
+        await interaction.followup.send("❌ 파티 생성 중 오류가 발생했어요.", ephemeral=True)
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    # 관리자 등이 모집글을 직접 삭제한 경우 남은 DB 데이터가 참가를 막지 않도록 함께 정리
+    party_ref = db.collection(PARTY_COLLECTION).document(str(payload.message_id))
+    try:
+        snapshot = await asyncio.to_thread(party_ref.get)
+        if snapshot.exists:
+            await asyncio.to_thread(party_ref.delete)
+    except Exception:
+        log.exception("삭제된 파티 모집글 DB 정리 실패 — message=%s", payload.message_id)
+
+
+async def get_party_message(data):
+    guild = bot.get_guild(int(data["guild_id"]))
+    if guild is None:
+        return None, "guild_missing"
+    channel = guild.get_channel(int(data["channel_id"]))
+    if channel is None:
+        return None, "channel_missing"
+    try:
+        return await channel.fetch_message(int(data["message_id"])), None
+    except discord.NotFound:
+        return None, "message_missing"
+
+
+@tasks.loop(minutes=1)
+async def cleanup_parties():
+    try:
+        parties = await asyncio.to_thread(list_parties)
+    except Exception:
+        log.exception("파티 자동 정리 목록 조회 실패")
+        return
+
+    now = utc_now()
+    for party_id, data in parties:
+        try:
+            scheduled_at = as_utc(data.get("scheduled_at"))
+            delete_at = as_utc(data.get("delete_at"))
+            if scheduled_at is None:
+                continue
+            delete_at = delete_at or scheduled_at + PARTY_DELETE_DELAY
+            party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+
+            if now >= delete_at:
+                message, reason = await get_party_message(data)
+                if message is not None:
+                    await message.delete()
+                if reason != "guild_missing":
+                    await asyncio.to_thread(party_ref.delete)
+                continue
+
+            if now >= scheduled_at and data.get("status") != "closed":
+                data["status"] = "closed"
+                data["updated_at"] = now
+                await asyncio.to_thread(
+                    party_ref.update,
+                    {"status": "closed", "updated_at": now},
+                )
+                message, reason = await get_party_message(data)
+                if message is not None:
+                    await message.edit(embed=build_party_embed(data), view=PartyView(data))
+                elif reason in {"channel_missing", "message_missing"}:
+                    await asyncio.to_thread(party_ref.delete)
+        except discord.Forbidden:
+            log.error("파티 모집글 정리 권한 없음 — party=%s", party_id)
+        except Exception:
+            log.exception("파티 자동 정리 실패 — party=%s", party_id)
+
+
+@cleanup_parties.before_loop
+async def before_cleanup_parties():
+    await bot.wait_until_ready()
 
 
 bot.run(TOKEN)
