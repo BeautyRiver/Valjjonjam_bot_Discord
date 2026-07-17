@@ -831,7 +831,7 @@ def parse_party_time(value):
     try:
         local_time = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=PARTY_TIMEZONE)
     except ValueError:
-        return None, "❌ 시작시간은 `2026-07-17 22:00`처럼 `YYYY-MM-DD HH:mm` 형식으로 입력해주세요."
+        return None, "❌ 선택한 날짜 또는 시간이 올바르지 않아요. 다시 선택해주세요."
 
     now_local = datetime.now(PARTY_TIMEZONE)
     if local_time < now_local + PARTY_MIN_LEAD:
@@ -893,13 +893,13 @@ def build_party_embed(data):
     )
     embed.add_field(name="파티장", value=f"<@{creator_id}>", inline=True)
     embed.add_field(
-        name="내전 시작",
+        name="파티 시작",
         value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
         inline=False,
     )
     embed.add_field(
         name="자동 삭제",
-        value=f"<t:{delete_timestamp}:F>\n내전 시작 10시간 후 자동으로 삭제됩니다.",
+        value=f"<t:{delete_timestamp}:F>\n파티 시작 10시간 후 자동으로 삭제됩니다.",
         inline=False,
     )
     embed.set_footer(text="한 사람은 동시에 하나의 파티에만 참가할 수 있습니다.")
@@ -1175,15 +1175,214 @@ async def configure_party_channel_error(interaction: discord.Interaction, error)
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
+def make_party_date_options():
+    today = datetime.now(PARTY_TIMEZONE).date()
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+    options = []
+    for offset, prefix in ((0, "오늘"), (1, "내일")):
+        target = today + timedelta(days=offset)
+        options.append(
+            discord.SelectOption(
+                label=f"{prefix} · {target.month}월 {target.day}일 ({weekdays[target.weekday()]})",
+                value=target.isoformat(),
+            )
+        )
+    return options
+
+
+def make_party_hour_options():
+    options = []
+    for hour in range(24):
+        period = "오전" if hour < 12 else "오후"
+        display_hour = hour % 12 or 12
+        options.append(
+            discord.SelectOption(
+                label=f"{period} {display_hour}시",
+                value=f"{hour:02d}",
+            )
+        )
+    return options
+
+
+class PartyCreationSelect(discord.ui.Select):
+    def __init__(self, parent_view, kind, placeholder, options, row):
+        super().__init__(
+            placeholder=placeholder,
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=row,
+        )
+        self.parent_view = parent_view
+        self.kind = kind
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        setattr(self.parent_view, self.kind, value)
+        for option in self.options:
+            option.default = option.value == value
+        await interaction.response.edit_message(
+            content=self.parent_view.render_content(),
+            view=self.parent_view,
+        )
+
+
+class PartyCreationView(discord.ui.View):
+    def __init__(self, owner_id, name, channel):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.name = name
+        self.channel = channel
+        self.selected_date = None
+        self.selected_hour = None
+        self.selected_minute = None
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_date",
+                "날짜 선택",
+                make_party_date_options(),
+                row=0,
+            )
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_hour",
+                "시간 선택",
+                make_party_hour_options(),
+                row=1,
+            )
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_minute",
+                "분 선택",
+                [
+                    discord.SelectOption(label="정각 (00분)", value="00"),
+                    discord.SelectOption(label="30분", value="30"),
+                ],
+                row=2,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "❌ 이 파티 생성 화면은 명령어를 실행한 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    def render_content(self):
+        date_text = "선택 전"
+        if self.selected_date:
+            target = datetime.strptime(self.selected_date, "%Y-%m-%d")
+            date_text = f"{target.month}월 {target.day}일"
+
+        time_text = "선택 전"
+        if self.selected_hour is not None and self.selected_minute is not None:
+            time_text = f"{self.selected_hour}:{self.selected_minute}"
+
+        return (
+            f"🎮 **{self.name}** 파티의 시작 시간을 선택해주세요.\n"
+            f"• 날짜: **{date_text}**\n"
+            f"• 시간: **{time_text}**\n\n"
+            "날짜·시간을 모두 선택한 뒤 `파티 생성`을 눌러주세요. "
+            "모집글은 파티 시작 10시간 후 자동으로 삭제됩니다."
+        )
+
+    @discord.ui.button(label="파티 생성", style=discord.ButtonStyle.success, row=3)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not all((self.selected_date, self.selected_hour, self.selected_minute)):
+            await interaction.response.send_message(
+                "❌ 날짜와 시간을 모두 선택해주세요.", ephemeral=True
+            )
+            return
+
+        scheduled_at, error = parse_party_time(
+            f"{self.selected_date} {self.selected_hour}:{self.selected_minute}"
+        )
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        message = await publish_party(interaction, self.channel, self.name, scheduled_at)
+        if message is None:
+            return
+
+        self.stop()
+        await interaction.edit_original_response(
+            content=(
+                f"✅ 파티 모집글을 만들었어요! {message.jump_url}\n"
+                "모집은 파티 시작 시간에 마감되고, 파티 시작 10시간 후 자동 삭제됩니다."
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
+
+
+async def publish_party(interaction, channel, name, scheduled_at):
+    creator_id = str(interaction.user.id)
+
+    try:
+        async with party_action_lock:
+            active = await find_active_party_for_member(str(interaction.guild.id), creator_id)
+            if active is not None:
+                await interaction.followup.send(
+                    "❌ 이미 참가 중인 파티가 있어요. 기존 파티에서 나오거나 파티를 삭제한 뒤 다시 만들어주세요.",
+                    ephemeral=True,
+                )
+                return None
+
+            now = utc_now()
+            data = {
+                "name": name,
+                "creator_id": creator_id,
+                "member_ids": [creator_id],
+                "guild_id": str(interaction.guild.id),
+                "channel_id": str(channel.id),
+                "scheduled_at": scheduled_at,
+                "delete_at": scheduled_at + PARTY_DELETE_DELAY,
+                "created_at": now,
+                "updated_at": now,
+                "status": "open",
+            }
+
+            message = await channel.send(embed=build_party_embed(data))
+            data["message_id"] = str(message.id)
+            party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
+            try:
+                await asyncio.to_thread(party_ref.set, data)
+                await message.edit(embed=build_party_embed(data), view=PartyView(data))
+            except Exception:
+                await asyncio.to_thread(party_ref.delete)
+                try:
+                    await message.delete()
+                except discord.NotFound:
+                    pass
+                raise
+        return message
+    except Exception:
+        log.exception("파티 생성 실패 — creator=%s", creator_id)
+        await interaction.followup.send("❌ 파티 생성 중 오류가 발생했어요.", ephemeral=True)
+        return None
+
+
 @bot.tree.command(name="파티생성", description="5인 파티 모집글을 생성합니다")
 @app_commands.describe(
     파티이름="파티 이름 (최대 30자)",
-    시작시간="한국시간 기준 YYYY-MM-DD HH:mm (현재부터 24시간 이내)",
 )
 async def create_party(
     interaction: discord.Interaction,
     파티이름: app_commands.Range[str, 1, 30],
-    시작시간: str,
 ):
     if await block_if_not_in_guild(interaction):
         return
@@ -1193,11 +1392,6 @@ async def create_party(
     name = 파티이름.strip()
     if not name:
         await interaction.response.send_message("❌ 파티 이름을 입력해주세요.", ephemeral=True)
-        return
-
-    scheduled_at, error = parse_party_time(시작시간)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1234,54 +1428,12 @@ async def create_party(
         )
         return
 
-    creator_id = str(interaction.user.id)
-
-    try:
-        async with party_action_lock:
-            active = await find_active_party_for_member(str(interaction.guild.id), creator_id)
-            if active is not None:
-                await interaction.followup.send(
-                    "❌ 이미 참가 중인 파티가 있어요. 기존 파티에서 나오거나 파티를 삭제한 뒤 다시 만들어주세요.",
-                    ephemeral=True,
-                )
-                return
-
-            now = utc_now()
-            data = {
-                "name": name,
-                "creator_id": creator_id,
-                "member_ids": [creator_id],
-                "guild_id": str(interaction.guild.id),
-                "channel_id": str(channel.id),
-                "scheduled_at": scheduled_at,
-                "delete_at": scheduled_at + PARTY_DELETE_DELAY,
-                "created_at": now,
-                "updated_at": now,
-                "status": "open",
-            }
-
-            message = await channel.send(embed=build_party_embed(data))
-            data["message_id"] = str(message.id)
-            party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
-            try:
-                await asyncio.to_thread(party_ref.set, data)
-                await message.edit(embed=build_party_embed(data), view=PartyView(data))
-            except Exception:
-                await asyncio.to_thread(party_ref.delete)
-                try:
-                    await message.delete()
-                except discord.NotFound:
-                    pass
-                raise
-
-        await interaction.followup.send(
-            f"✅ 파티 모집글을 만들었어요! {message.jump_url}\n"
-            "모집은 시작시간에 마감되고, 시작시간 10시간 후 자동 삭제됩니다.",
-            ephemeral=True,
-        )
-    except Exception:
-        log.exception("파티 생성 실패 — creator=%s", creator_id)
-        await interaction.followup.send("❌ 파티 생성 중 오류가 발생했어요.", ephemeral=True)
+    view = PartyCreationView(interaction.user.id, name, channel)
+    await interaction.followup.send(
+        view.render_content(),
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.event
@@ -1309,7 +1461,7 @@ async def get_party_message(data):
         return None, "message_missing"
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def cleanup_parties():
     try:
         parties = await asyncio.to_thread(list_parties)
