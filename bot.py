@@ -79,6 +79,7 @@ VERIFIED_ROLE = "인증됨"
 PARTY_COLLECTION = "parties"
 GUILD_SETTINGS_COLLECTION = "guild_settings"
 PARTY_MAX_MEMBERS = 5
+INHOUSE_PARTY_MAX_MEMBERS = 10
 PARTY_TIMEZONE = timezone(timedelta(hours=9))
 PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
@@ -841,18 +842,28 @@ def parse_party_time(value):
     return local_time.astimezone(timezone.utc), None
 
 
+def party_max_members(data):
+    max_members = data.get("max_members", PARTY_MAX_MEMBERS)
+    return max_members if max_members in {PARTY_MAX_MEMBERS, INHOUSE_PARTY_MAX_MEMBERS} else PARTY_MAX_MEMBERS
+
+
+def party_type_name(max_members):
+    return "내전 파티 (10명)" if max_members == INHOUSE_PARTY_MAX_MEMBERS else "5인 파티"
+
+
 def party_status(data, now=None):
     now = now or utc_now()
     scheduled_at = as_utc(data.get("scheduled_at"))
     if scheduled_at is None or now >= scheduled_at:
         return "closed"
-    if len(data.get("member_ids", [])) >= PARTY_MAX_MEMBERS:
+    if len(data.get("member_ids", [])) >= party_max_members(data):
         return "full"
     return "open"
 
 
 def build_party_embed(data):
     status = party_status(data)
+    max_members = party_max_members(data)
     status_text = {
         "open": "🟢 모집 중",
         "full": "🔴 모집 완료",
@@ -867,7 +878,7 @@ def build_party_embed(data):
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
     creator_id = str(data.get("creator_id", ""))
     member_lines = []
-    for index in range(PARTY_MAX_MEMBERS):
+    for index in range(max_members):
         if index < len(member_ids):
             user_id = member_ids[index]
             owner = " 👑" if user_id == creator_id else ""
@@ -881,14 +892,15 @@ def build_party_embed(data):
     delete_timestamp = int(delete_at.timestamp())
 
     embed = discord.Embed(
-        title=f"🎮 {data['name']}",
+        title=f"🎮 {party_type_name(max_members)} · {data['name']}",
         description="\n".join(member_lines),
         color=color,
     )
     embed.add_field(name="상태", value=status_text, inline=True)
+    embed.add_field(name="모집 유형", value=party_type_name(max_members), inline=True)
     embed.add_field(
         name="현재 인원",
-        value=f"**{len(member_ids)} / {PARTY_MAX_MEMBERS}**",
+        value=f"**{len(member_ids)} / {max_members}**",
         inline=True,
     )
     embed.add_field(name="파티장", value=f"<@{creator_id}>", inline=True)
@@ -950,7 +962,7 @@ class PartyView(discord.ui.View):
             messages = {
                 "missing": "❌ 이미 삭제된 파티예요.",
                 "closed": "❌ 모집이 마감된 파티예요.",
-                "full": "❌ 이미 5명이 모두 모였어요.",
+                "full": f"❌ 이미 {party_max_members(data)}명이 모두 모였어요.",
                 "already": "ℹ️ 이미 이 파티에 참가하고 있어요.",
                 "joined": "✅ 파티에 참가했어요!",
             }
@@ -1073,12 +1085,13 @@ def join_party_transaction(transaction, party_ref, user_id, now):
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
     if user_id in member_ids:
         return "already", data
-    if len(member_ids) >= PARTY_MAX_MEMBERS:
+    max_members = party_max_members(data)
+    if len(member_ids) >= max_members:
         return "full", data
 
     member_ids.append(user_id)
     data["member_ids"] = member_ids
-    data["status"] = "full" if len(member_ids) >= PARTY_MAX_MEMBERS else "open"
+    data["status"] = "full" if len(member_ids) >= max_members else "open"
     data["updated_at"] = now
     transaction.update(
         party_ref,
@@ -1228,11 +1241,12 @@ class PartyCreationSelect(discord.ui.Select):
 
 
 class PartyCreationView(discord.ui.View):
-    def __init__(self, owner_id, name, channel):
+    def __init__(self, owner_id, name, channel, max_members):
         super().__init__(timeout=300)
         self.owner_id = str(owner_id)
         self.name = name
         self.channel = channel
+        self.max_members = max_members
         self.selected_date = None
         self.selected_hour = None
         self.selected_minute = None
@@ -1287,7 +1301,7 @@ class PartyCreationView(discord.ui.View):
             time_text = f"{self.selected_hour}:{self.selected_minute}"
 
         return (
-            f"🎮 **{self.name}** 파티의 시작 시간을 선택해주세요.\n"
+            f"🎮 **{party_type_name(self.max_members)} · {self.name}**의 시작 시간을 선택해주세요.\n"
             f"• 날짜: **{date_text}**\n"
             f"• 시간: **{time_text}**\n\n"
             "날짜·시간을 모두 선택한 뒤 `파티 생성`을 눌러주세요. "
@@ -1310,7 +1324,9 @@ class PartyCreationView(discord.ui.View):
             return
 
         await interaction.response.defer()
-        message = await publish_party(interaction, self.channel, self.name, scheduled_at)
+        message = await publish_party(
+            interaction, self.channel, self.name, scheduled_at, self.max_members
+        )
         if message is None:
             return
 
@@ -1329,7 +1345,48 @@ class PartyCreationView(discord.ui.View):
         await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
 
 
-async def publish_party(interaction, channel, name, scheduled_at):
+class PartyTypeSelectionView(discord.ui.View):
+    def __init__(self, owner_id, name, channel):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.name = name
+        self.channel = channel
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "❌ 이 파티 생성 화면은 명령어를 실행한 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    async def select_type(self, interaction, max_members):
+        self.stop()
+        view = PartyCreationView(self.owner_id, self.name, self.channel, max_members)
+        await interaction.response.edit_message(
+            content=(
+                f"🎮 **{party_type_name(max_members)} · {self.name}**을 선택했어요.\n"
+                "이제 시작 날짜와 시간을 선택해주세요."
+            ),
+            view=view,
+        )
+
+    @discord.ui.button(label="5인 파티", style=discord.ButtonStyle.primary)
+    async def five_member_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.select_type(interaction, PARTY_MAX_MEMBERS)
+
+    @discord.ui.button(label="내전 파티 (10명)", style=discord.ButtonStyle.danger)
+    async def inhouse_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.select_type(interaction, INHOUSE_PARTY_MAX_MEMBERS)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
+
+
+async def publish_party(interaction, channel, name, scheduled_at, max_members):
     creator_id = str(interaction.user.id)
 
     try:
@@ -1349,6 +1406,7 @@ async def publish_party(interaction, channel, name, scheduled_at):
                 "member_ids": [creator_id],
                 "guild_id": str(interaction.guild.id),
                 "channel_id": str(channel.id),
+                "max_members": max_members,
                 "scheduled_at": scheduled_at,
                 "delete_at": scheduled_at + PARTY_DELETE_DELAY,
                 "created_at": now,
@@ -1376,7 +1434,7 @@ async def publish_party(interaction, channel, name, scheduled_at):
         return None
 
 
-@bot.tree.command(name="파티생성", description="5인 파티 모집글을 생성합니다")
+@bot.tree.command(name="파티생성", description="5인 또는 내전 파티 모집글을 생성합니다")
 @app_commands.describe(
     파티이름="파티 이름 (최대 30자)",
 )
@@ -1428,9 +1486,9 @@ async def create_party(
         )
         return
 
-    view = PartyCreationView(interaction.user.id, name, channel)
+    view = PartyTypeSelectionView(interaction.user.id, name, channel)
     await interaction.followup.send(
-        view.render_content(),
+        f"🎮 **{name}** 파티의 모집 유형을 선택해주세요.",
         view=view,
         ephemeral=True,
     )
