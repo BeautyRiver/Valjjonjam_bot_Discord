@@ -80,28 +80,6 @@ INTERNAL_TIER_LABELS = {
     "4상": "4티어 -상", "4하": "4티어 -하", "4?": "4티어 -?",
     "5상": "5티어 -상", "5하": "5티어 -하", "5?": "5티어 -?",
 }
-INTERNAL_TIER_GROUPS = [
-    ("1", ["유규현", "김민강", "노우진", "조화신"]),
-    ("2상", ["김도현", "이시은", "이정진"]),
-    ("2하", ["박경필", "이주홍", "서진", "황지영"]),
-    ("3상", ["신유성", "조계헌", "김민서"]),
-    ("3하", ["이은성", "김수빈", "최민기"]),
-    ("4상", ["강태희", "김선우", "권지후", "이정대"]),
-    ("4하", ["전서현", "권유빈"]),
-    ("4?", ["박민수", "김정민"]),
-    ("5상", ["손동찬", "김성현", "김효연", "우예원"]),
-    ("5하", ["노현민", "김나영", "손마루", "김현서"]),
-    ("5?", ["손종민", "허영무", "김승태", "신재경"]),
-]
-
-def normalize_member_name(name):
-    return "".join((name or "").split())
-
-INTERNAL_TIER_BY_NAME = {
-    normalize_member_name(name): tier
-    for tier, names in INTERNAL_TIER_GROUPS
-    for name in names
-}
 INTERNAL_TIER_CHOICES = [
     app_commands.Choice(name=label, value=tier)
     for tier, label in INTERNAL_TIER_LABELS.items()
@@ -662,64 +640,6 @@ async def clear_internal_tier(interaction: discord.Interaction, 대상: discord.
 
 @clear_internal_tier.error
 async def clear_internal_tier_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
-
-def seed_internal_tiers():
-    documents = list(db.collection("users").stream())
-    batch = db.batch()
-    updated_docs = 0
-    skipped_docs = 0
-    matched_names = set()
-
-    for document in documents:
-        data = document.to_dict() or {}
-        normalized_name = normalize_member_name(data.get("name"))
-        tier = INTERNAL_TIER_BY_NAME.get(normalized_name)
-        if tier is None:
-            skipped_docs += 1
-            continue
-        batch.set(
-            document.reference,
-            {"internal_tier": tier, "updated_at": firestore.SERVER_TIMESTAMP},
-            merge=True,
-        )
-        updated_docs += 1
-        matched_names.add(normalized_name)
-
-    if updated_docs:
-        batch.commit()
-
-    missing_names = [
-        name
-        for _, names in INTERNAL_TIER_GROUPS
-        for name in names
-        if normalize_member_name(name) not in matched_names
-    ]
-    return updated_docs, skipped_docs, matched_names, missing_names
-
-
-@bot.tree.command(name="내부티어일괄등록", description="(일회성) 현재 내부 티어 명단을 DB에 한 번에 등록합니다")
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def seed_all_internal_tiers(interaction: discord.Interaction):
-    if await block_if_not_in_guild(interaction):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    updated_docs, skipped_docs, matched_names, missing_names = await asyncio.to_thread(seed_internal_tiers)
-    missing_text = ", ".join(missing_names) if missing_names else "없음"
-    await interaction.followup.send(
-        "✅ 발쫀잼 내부 티어 일괄등록 완료!\n"
-        f"💾 저장 문서: {updated_docs}개 | 👤 명단 매칭: {len(matched_names)}/37명 | ⏭️ 명단 외 문서: {skipped_docs}개\n"
-        f"❓ DB에서 못 찾은 명단: {missing_text}",
-        ephemeral=True,
-    )
-
-
-@seed_all_internal_tiers.error
-async def seed_all_internal_tiers_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
