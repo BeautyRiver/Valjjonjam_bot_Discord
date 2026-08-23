@@ -177,6 +177,7 @@ async def on_ready():
     if not getattr(bot, "party_view_registered", False):
         bot.add_view(PartyView())
         bot.party_view_registered = True
+        await refresh_party_messages()
     if not cleanup_parties.is_running():
         cleanup_parties.start()
     await bot.tree.sync()
@@ -386,47 +387,6 @@ async def create_roles(interaction: discord.Interaction):
     else:
         await interaction.followup.send("이미 모든 역할이 존재합니다!", ephemeral=True)
         
-class DeleteConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=30)
-
-    @discord.ui.button(label="✅ 예", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
-        deleted = []
-
-        all_roles = TIERS + ROLES
-        for role in guild.roles:
-            if role.name in all_roles:
-                await role.delete()
-                deleted.append(role.name)
-
-        if deleted:
-            await interaction.followup.send(f"🗑️ {len(deleted)}개 역할 삭제 완료!\n`{'`, `'.join(deleted)}`", ephemeral=True)
-        else:
-            await interaction.followup.send("삭제할 역할이 없습니다!", ephemeral=True)
-
-    @discord.ui.button(label="❌ 아니요", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("취소했습니다.", ephemeral=True)
-
-@bot.tree.command(name="역할삭제", description="역할군&티어 역할을 전부 삭제합니다")
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def delete_roles(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "⚠️ 정말로 모든 역할군/티어를 삭제할까요?",
-        view=DeleteConfirmView(),
-        ephemeral=True
-    )
-
-@delete_roles.error
-async def delete_roles_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
-
 @bot.tree.command(name="메세지", description="봇이 현재 채널에 임베드 메세지를 보냅니다")
 @app_commands.describe(
     내용="보낼 내용 (줄바꿈은 \\n 으로 입력)",
@@ -454,43 +414,6 @@ async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = N
 
 @bot_say.error
 async def bot_say_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
-
-@bot.tree.command(name="인증일괄적용", description="DB에 등록된 기존 멤버 전원에게 인증 역할을 부여합니다 (일회성)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def grant_verified(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    role = await get_or_create_verified_role(guild)
-
-    # DB에 등록된 모든 discord_id 한 번에 조회
-    registered = await asyncio.to_thread(
-        lambda: {doc.id for doc in db.collection("users").stream()}
-    )
-
-    granted, already, missing = 0, 0, 0
-    for uid in registered:
-        member = guild.get_member(int(uid))
-        if member is None:
-            missing += 1  # DB엔 있는데 서버엔 없는(나간) 멤버
-            continue
-        if role in member.roles:
-            already += 1
-            continue
-        await member.add_roles(role)
-        granted += 1
-
-    await interaction.followup.send(
-        f"✅ 인증 역할 일괄 적용 완료!\n"
-        f"🆕 부여: {granted}명 | ✔️ 이미 보유: {already}명 | ❓ 서버에 없음: {missing}명",
-        ephemeral=True
-    )
-
-@grant_verified.error
-async def grant_verified_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
@@ -528,32 +451,86 @@ async def announce_unverified_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
-@bot.tree.command(name="탈퇴정리", description="서버를 나간 멤버의 등록 정보를 DB에서 삭제합니다")
+async def send_ephemeral_log(interaction, title, lines):
+    """Discord 2,000자 제한에 맞춰 비공개 로그를 나눠 보냄."""
+    message = title
+    for line in lines:
+        next_message = f"{message}\n{line}"
+        if len(next_message) <= 1900:
+            message = next_message
+            continue
+        await interaction.followup.send(message, ephemeral=True)
+        message = f"{title} **(계속)**\n{line}"
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@bot.tree.command(name="탈퇴정리", description="서버에 없는 멤버를 확인해 DB에서 삭제하고 명단을 알려줍니다")
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def cleanup_db(interaction: discord.Interaction):
+    if await block_if_not_in_guild(interaction):
+        return
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
-    # DB에 등록된 모든 discord_id 조회
     registered = await asyncio.to_thread(
-        lambda: {doc.id for doc in db.collection("users").stream()}
+        lambda: list(db.collection("users").stream())
     )
+    gone = []
+    lookup_failed = []
 
-    # 서버에 더 이상 없는(나간) 멤버의 ID만 추림
-    gone = [uid for uid in registered if guild.get_member(int(uid)) is None]
+    # 캐시에 없으면 Discord API로 다시 확인하고, 실제로 없는 멤버만 삭제 대상으로 삼음
+    for document in registered:
+        user_id = document.id
+        data = document.to_dict() or {}
+        saved_name = data.get("name") or data.get("nickname") or data.get("username") or "이름 없음"
+        saved_name = discord.utils.escape_markdown(discord.utils.escape_mentions(saved_name))
+        label = f"{saved_name} (`{user_id}`)"
 
-    # DB에서 한 번에 삭제
+        try:
+            member_id = int(user_id)
+        except (TypeError, ValueError):
+            lookup_failed.append(f"{label} — 잘못된 Discord ID")
+            continue
+
+        if guild.get_member(member_id) is not None:
+            continue
+        try:
+            await guild.fetch_member(member_id)
+        except discord.NotFound:
+            gone.append((document, label))
+        except (discord.Forbidden, discord.HTTPException):
+            lookup_failed.append(f"{label} — Discord 조회 실패")
+
     def delete_docs():
-        for uid in gone:
-            db.collection("users").document(uid).delete()
-    await asyncio.to_thread(delete_docs)
+        batch = db.batch()
+        for document, _ in gone:
+            batch.delete(document.reference)
+        batch.commit()
+
+    if gone:
+        await asyncio.to_thread(delete_docs)
 
     await interaction.followup.send(
-        f"🧹 DB 정리 완료!\n"
-        f"🗑️ 삭제: {len(gone)}명 | 👥 남은 등록: {len(registered) - len(gone)}명",
+        "🧹 **탈퇴 멤버 DB 정리 완료**\n"
+        "Discord 서버에 실제로 없는 계정만 Firebase `users`에서 삭제했습니다.\n"
+        f"🗑️ 삭제: {len(gone)}명 | 👥 남은 등록: {len(registered) - len(gone)}명"
+        f" | ⚠️ 조회 보류: {len(lookup_failed)}명",
         ephemeral=True
     )
+
+    deleted_lines = [f"• {label}" for _, label in gone]
+    if deleted_lines:
+        await send_ephemeral_log(interaction, "🗑️ **삭제된 멤버**", deleted_lines)
+    else:
+        await interaction.followup.send("✅ 삭제할 탈퇴 멤버가 없었습니다.", ephemeral=True)
+
+    if lookup_failed:
+        await send_ephemeral_log(
+            interaction,
+            "⚠️ **삭제하지 않고 보류한 멤버**",
+            [f"• {line}" for line in lookup_failed],
+        )
 
 @cleanup_db.error
 async def cleanup_db_error(interaction: discord.Interaction, error):
@@ -958,7 +935,28 @@ def party_status(data, now=None):
     return "open"
 
 
-def build_party_embed(data):
+async def get_party_member_names(guild, user_ids):
+    names = {}
+    for user_id in dict.fromkeys(user_ids):
+        member = None
+        try:
+            member_id = int(user_id)
+            member = guild.get_member(member_id)
+            if member is None:
+                member = await guild.fetch_member(member_id)
+        except (TypeError, ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        if member is None:
+            names[user_id] = "알 수 없는 사용자"
+            continue
+
+        display_name = discord.utils.escape_mentions(member.display_name)
+        names[user_id] = discord.utils.escape_markdown(display_name)
+    return names
+
+
+async def build_party_embed(data, guild):
     status = party_status(data)
     max_members = party_max_members(data)
     status_text = {
@@ -974,12 +972,13 @@ def build_party_embed(data):
 
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
     creator_id = str(data.get("creator_id", ""))
+    member_names = await get_party_member_names(guild, member_ids + [creator_id])
     member_lines = []
     for index in range(max_members):
         if index < len(member_ids):
             user_id = member_ids[index]
             owner = " 👑" if user_id == creator_id else ""
-            member_lines.append(f"{index + 1}. <@{user_id}>{owner}")
+            member_lines.append(f"{index + 1}. {member_names[user_id]}{owner}")
         else:
             member_lines.append(f"{index + 1}. *모집 중*")
 
@@ -1000,7 +999,7 @@ def build_party_embed(data):
         value=f"**{len(member_ids)} / {max_members}**",
         inline=True,
     )
-    embed.add_field(name="파티장", value=f"<@{creator_id}>", inline=True)
+    embed.add_field(name="파티장", value=member_names[creator_id], inline=True)
     embed.add_field(
         name="파티 시작",
         value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
@@ -1064,7 +1063,8 @@ class PartyView(discord.ui.View):
                 "joined": "✅ 파티에 참가했어요!",
             }
             if result == "joined":
-                await interaction.message.edit(embed=build_party_embed(data), view=PartyView(data))
+                embed = await build_party_embed(data, interaction.guild)
+                await interaction.message.edit(embed=embed, view=PartyView(data))
             await interaction.followup.send(messages[result], ephemeral=True)
         except Exception:
             log.exception("파티 참가 처리 실패 — party=%s user=%s", party_id, user_id)
@@ -1099,7 +1099,8 @@ class PartyView(discord.ui.View):
                 "left": "✅ 파티 참가를 취소했어요.",
             }
             if result == "left":
-                await interaction.message.edit(embed=build_party_embed(data), view=PartyView(data))
+                embed = await build_party_embed(data, interaction.guild)
+                await interaction.message.edit(embed=embed, view=PartyView(data))
             await interaction.followup.send(messages[result], ephemeral=True)
         except Exception:
             log.exception("파티 참가 취소 실패 — party=%s user=%s", party_id, user_id)
@@ -1511,12 +1512,13 @@ async def publish_party(interaction, channel, name, scheduled_at, max_members):
                 "status": "open",
             }
 
-            message = await channel.send(embed=build_party_embed(data))
+            embed = await build_party_embed(data, interaction.guild)
+            message = await channel.send(embed=embed)
             data["message_id"] = str(message.id)
             party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
             try:
                 await asyncio.to_thread(party_ref.set, data)
-                await message.edit(embed=build_party_embed(data), view=PartyView(data))
+                await message.edit(embed=embed, view=PartyView(data))
             except Exception:
                 await asyncio.to_thread(party_ref.delete)
                 try:
@@ -1616,6 +1618,26 @@ async def get_party_message(data):
         return None, "message_missing"
 
 
+async def refresh_party_messages():
+    try:
+        parties = await asyncio.to_thread(list_parties)
+    except Exception:
+        log.exception("기존 파티 모집글 목록 조회 실패")
+        return
+
+    for party_id, data in parties:
+        try:
+            message, _ = await get_party_message(data)
+            if message is None:
+                continue
+            embed = await build_party_embed(data, message.guild)
+            await message.edit(embed=embed, view=PartyView(data))
+        except discord.Forbidden:
+            log.error("기존 파티 모집글 갱신 권한 없음 — party=%s", party_id)
+        except Exception:
+            log.exception("기존 파티 모집글 갱신 실패 — party=%s", party_id)
+
+
 @tasks.loop(minutes=5)
 async def cleanup_parties():
     try:
@@ -1651,7 +1673,8 @@ async def cleanup_parties():
                 )
                 message, reason = await get_party_message(data)
                 if message is not None:
-                    await message.edit(embed=build_party_embed(data), view=PartyView(data))
+                    embed = await build_party_embed(data, message.guild)
+                    await message.edit(embed=embed, view=PartyView(data))
                 elif reason in {"channel_missing", "message_missing"}:
                     await asyncio.to_thread(party_ref.delete)
         except discord.Forbidden:
