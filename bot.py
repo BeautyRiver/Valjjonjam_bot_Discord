@@ -90,6 +90,7 @@ VERIFIED_ROLE = "인증됨"
 
 # 파티 모집 설정
 PARTY_COLLECTION = "parties"
+EVENT_COLLECTION = "events"
 GUILD_SETTINGS_COLLECTION = "guild_settings"
 PARTY_MAX_MEMBERS = 5
 INHOUSE_PARTY_MAX_MEMBERS = 10
@@ -97,6 +98,7 @@ PARTY_TIMEZONE = timezone(timedelta(hours=9))
 PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
+EVENT_MAX_LEAD = timedelta(days=14)
 
 # 인증 역할을 가져오거나 없으면 생성
 async def get_or_create_verified_role(guild):
@@ -173,13 +175,19 @@ def build_unverified_notice(guild=None):
 
 @bot.event
 async def on_ready():
-    # 재시작 후에도 기존 파티 모집글의 버튼이 계속 동작하도록 영구 View 등록
+    # 재시작 후에도 기존 모집글의 버튼이 계속 동작하도록 영구 View 등록
     if not getattr(bot, "party_view_registered", False):
         bot.add_view(PartyView())
         bot.party_view_registered = True
         await refresh_party_messages()
+    if not getattr(bot, "event_view_registered", False):
+        bot.add_view(EventView())
+        bot.event_view_registered = True
+        await refresh_event_messages()
     if not cleanup_parties.is_running():
         cleanup_parties.start()
+    if not close_started_events.is_running():
+        close_started_events.start()
     await bot.tree.sync()
     print(f"{bot.user} 온라인!")
 
@@ -885,7 +893,7 @@ async def admin_change_nickname_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
-# ===== 5인 파티 모집 =====
+# ===== 파티 모집 =====
 
 party_action_lock = asyncio.Lock()
 
@@ -913,6 +921,20 @@ def parse_party_time(value):
         return None, "❌ 시작시간은 현재 시각보다 최소 10분 이후여야 해요."
     if local_time > now_local + PARTY_MAX_LEAD:
         return None, "❌ 시작시간은 현재부터 24시간 이내로 정해주세요."
+    return local_time.astimezone(timezone.utc), None
+
+
+def parse_event_time(value):
+    try:
+        local_time = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=PARTY_TIMEZONE)
+    except ValueError:
+        return None, "❌ 선택한 날짜 또는 시간이 올바르지 않아요. 다시 선택해주세요."
+
+    now_local = datetime.now(PARTY_TIMEZONE)
+    if local_time < now_local + PARTY_MIN_LEAD:
+        return None, "❌ 시작시간은 현재 시각보다 최소 10분 이후여야 해요."
+    if local_time > now_local + EVENT_MAX_LEAD:
+        return None, "❌ 이벤트는 현재부터 14일 이내로 정해주세요."
     return local_time.astimezone(timezone.utc), None
 
 
@@ -954,6 +976,15 @@ async def get_party_member_names(guild, user_ids):
         display_name = discord.utils.escape_mentions(member.display_name)
         names[user_id] = discord.utils.escape_markdown(display_name)
     return names
+
+
+async def try_edit_recruitment_message(message, embed, view, kind, recruitment_id):
+    try:
+        await message.edit(embed=embed, view=view)
+        return True
+    except discord.HTTPException:
+        log.exception("%s 모집글 표시 갱신 실패 — id=%s", kind, recruitment_id)
+        return False
 
 
 async def build_party_embed(data, guild):
@@ -1010,7 +1041,7 @@ async def build_party_embed(data, guild):
         value=f"<t:{delete_timestamp}:F>\n파티 시작 10시간 후 자동으로 삭제됩니다.",
         inline=False,
     )
-    embed.set_footer(text="한 사람은 동시에 하나의 파티에만 참가할 수 있습니다.")
+    embed.set_footer(text="다른 파티에도 동시에 참가할 수 있습니다.")
     return embed
 
 
@@ -1021,6 +1052,7 @@ class PartyView(discord.ui.View):
             status = party_status(data)
             self.join_party.disabled = status != "open"
             self.leave_party.disabled = status == "closed"
+            self.change_party_time.disabled = status == "closed"
 
     @discord.ui.button(
         label="참가하기",
@@ -1039,16 +1071,6 @@ class PartyView(discord.ui.View):
 
         try:
             async with party_action_lock:
-                other = await find_active_party_for_member(
-                    str(interaction.guild.id), user_id, exclude_party_id=party_id
-                )
-                if other is not None:
-                    await interaction.followup.send(
-                        "❌ 이미 다른 파티에 참가 중이에요. 기존 파티에서 참가 취소 후 다시 시도해주세요.",
-                        ephemeral=True,
-                    )
-                    return
-
                 party_ref = db.collection(PARTY_COLLECTION).document(party_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
@@ -1058,14 +1080,19 @@ class PartyView(discord.ui.View):
             messages = {
                 "missing": "❌ 이미 삭제된 파티예요.",
                 "closed": "❌ 모집이 마감된 파티예요.",
-                "full": f"❌ 이미 {party_max_members(data)}명이 모두 모였어요.",
+                "full": f"❌ 이미 {party_max_members(data or {})}명이 모두 모였어요.",
                 "already": "ℹ️ 이미 이 파티에 참가하고 있어요.",
                 "joined": "✅ 파티에 참가했어요!",
             }
+            refresh_warning = ""
             if result == "joined":
                 embed = await build_party_embed(data, interaction.guild)
-                await interaction.message.edit(embed=embed, view=PartyView(data))
-            await interaction.followup.send(messages[result], ephemeral=True)
+                refreshed = await try_edit_recruitment_message(
+                    interaction.message, embed, PartyView(data), "파티", party_id
+                )
+                if not refreshed:
+                    refresh_warning = "\n⚠️ 참가는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
         except Exception:
             log.exception("파티 참가 처리 실패 — party=%s user=%s", party_id, user_id)
             await interaction.followup.send("❌ 파티 참가 처리 중 오류가 발생했어요.", ephemeral=True)
@@ -1098,13 +1125,67 @@ class PartyView(discord.ui.View):
                 "not_member": "ℹ️ 이 파티에 참가하고 있지 않아요.",
                 "left": "✅ 파티 참가를 취소했어요.",
             }
+            refresh_warning = ""
             if result == "left":
                 embed = await build_party_embed(data, interaction.guild)
-                await interaction.message.edit(embed=embed, view=PartyView(data))
-            await interaction.followup.send(messages[result], ephemeral=True)
+                refreshed = await try_edit_recruitment_message(
+                    interaction.message, embed, PartyView(data), "파티", party_id
+                )
+                if not refreshed:
+                    refresh_warning = "\n⚠️ 취소는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
         except Exception:
             log.exception("파티 참가 취소 실패 — party=%s user=%s", party_id, user_id)
             await interaction.followup.send("❌ 참가 취소 처리 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="시간 변경",
+        style=discord.ButtonStyle.primary,
+        custom_id="party:change_time",
+    )
+    async def change_party_time(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        party_id = str(interaction.message.id)
+
+        try:
+            data = await asyncio.to_thread(get_party_data, party_id)
+            if data is None:
+                await interaction.followup.send("❌ 이미 삭제된 파티예요.", ephemeral=True)
+                return
+
+            is_creator = str(interaction.user.id) == str(data.get("creator_id"))
+            is_admin = interaction.user.guild_permissions.administrator
+            if not is_creator and not is_admin:
+                await interaction.followup.send(
+                    "❌ 파티장 또는 관리자만 시작 시간을 변경할 수 있어요.",
+                    ephemeral=True,
+                )
+                return
+            if party_status(data) == "closed":
+                await interaction.followup.send(
+                    "❌ 이미 시작한 파티의 시간은 변경할 수 없어요.", ephemeral=True
+                )
+                return
+
+            view = PartyTimeEditView(
+                interaction.user.id,
+                party_id,
+                interaction.message,
+                data,
+            )
+            await interaction.followup.send(
+                view.render_content(),
+                view=view,
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception("파티 시간 변경 화면 열기 실패 — party=%s", party_id)
+            await interaction.followup.send(
+                "❌ 시간 변경 화면을 여는 중 오류가 발생했어요.", ephemeral=True
+            )
 
     @discord.ui.button(
         label="파티 삭제",
@@ -1152,22 +1233,6 @@ def get_party_data(party_id):
 
 def list_parties():
     return [(doc.id, doc.to_dict()) for doc in db.collection(PARTY_COLLECTION).stream()]
-
-
-async def find_active_party_for_member(guild_id, user_id, exclude_party_id=None):
-    parties = await asyncio.to_thread(list_parties)
-    now = utc_now()
-    for party_id, data in parties:
-        if party_id == exclude_party_id:
-            continue
-        if str(data.get("guild_id")) != str(guild_id):
-            continue
-        if str(user_id) not in [str(uid) for uid in data.get("member_ids", [])]:
-            continue
-        scheduled_at = as_utc(data.get("scheduled_at"))
-        if scheduled_at is not None and now < scheduled_at:
-            return party_id, data
-    return None
 
 
 @transactional
@@ -1231,6 +1296,39 @@ def leave_party_transaction(transaction, party_ref, user_id, now):
         },
     )
     return "left", data
+
+
+@transactional
+def update_party_time_transaction(transaction, party_ref, scheduled_at, now):
+    snapshot = party_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    if party_status(data, now) == "closed":
+        return "closed", data
+
+    delete_at = scheduled_at + PARTY_DELETE_DELAY
+    member_count = len(data.get("member_ids", []))
+    status = "full" if member_count >= party_max_members(data) else "open"
+    data.update(
+        {
+            "scheduled_at": scheduled_at,
+            "delete_at": delete_at,
+            "status": status,
+            "updated_at": now,
+        }
+    )
+    transaction.update(
+        party_ref,
+        {
+            "scheduled_at": scheduled_at,
+            "delete_at": delete_at,
+            "status": status,
+            "updated_at": now,
+        },
+    )
+    return "updated", data
 
 
 def get_party_channel_id(guild_id):
@@ -1301,6 +1399,27 @@ def make_party_date_options():
     return options
 
 
+def make_event_date_options():
+    today = datetime.now(PARTY_TIMEZONE).date()
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+    options = []
+    for offset in range(14):
+        target = today + timedelta(days=offset)
+        if offset == 0:
+            prefix = "오늘 · "
+        elif offset == 1:
+            prefix = "내일 · "
+        else:
+            prefix = ""
+        options.append(
+            discord.SelectOption(
+                label=f"{prefix}{target.month}월 {target.day}일 ({weekdays[target.weekday()]})",
+                value=target.isoformat(),
+            )
+        )
+    return options
+
+
 def make_party_hour_options():
     options = []
     for hour in range(24):
@@ -1315,6 +1434,16 @@ def make_party_hour_options():
     return options
 
 
+def make_party_minute_options(extra_minute=None):
+    options = [
+        discord.SelectOption(label="정각 (00분)", value="00"),
+        discord.SelectOption(label="30분", value="30"),
+    ]
+    if extra_minute not in {None, "00", "30"}:
+        options.append(discord.SelectOption(label=f"{extra_minute}분 (현재)", value=extra_minute))
+    return options
+
+
 class PartyCreationSelect(discord.ui.Select):
     def __init__(self, parent_view, kind, placeholder, options, row):
         super().__init__(
@@ -1326,6 +1455,9 @@ class PartyCreationSelect(discord.ui.Select):
         )
         self.parent_view = parent_view
         self.kind = kind
+        current_value = getattr(parent_view, kind, None)
+        for option in self.options:
+            option.default = option.value == current_value
 
     async def callback(self, interaction: discord.Interaction):
         value = self.values[0]
@@ -1371,10 +1503,7 @@ class PartyCreationView(discord.ui.View):
                 self,
                 "selected_minute",
                 "분 선택",
-                [
-                    discord.SelectOption(label="정각 (00분)", value="00"),
-                    discord.SelectOption(label="30분", value="30"),
-                ],
+                make_party_minute_options(),
                 row=2,
             )
         )
@@ -1443,6 +1572,144 @@ class PartyCreationView(discord.ui.View):
         await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
 
 
+class PartyTimeEditView(discord.ui.View):
+    def __init__(self, owner_id, party_id, party_message, data):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.party_id = str(party_id)
+        self.party_message = party_message
+        self.name = data["name"]
+
+        current_time = as_utc(data["scheduled_at"]).astimezone(PARTY_TIMEZONE)
+        self.current_timestamp = int(current_time.timestamp())
+        self.selected_date = current_time.date().isoformat()
+        self.selected_hour = f"{current_time.hour:02d}"
+        self.selected_minute = f"{current_time.minute:02d}"
+
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_date",
+                "날짜 선택",
+                make_party_date_options(),
+                row=0,
+            )
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_hour",
+                "시간 선택",
+                make_party_hour_options(),
+                row=1,
+            )
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_minute",
+                "분 선택",
+                make_party_minute_options(self.selected_minute),
+                row=2,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "❌ 이 시간 변경 화면을 연 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    def render_content(self):
+        target = datetime.strptime(self.selected_date, "%Y-%m-%d")
+        date_text = f"{target.month}월 {target.day}일"
+        return (
+            f"⏰ **{self.name}** 파티의 시작 시간을 변경합니다.\n"
+            f"• 현재: <t:{self.current_timestamp}:F>\n"
+            f"• 변경: **{date_text} {self.selected_hour}:{self.selected_minute}**\n\n"
+            "날짜·시간을 확인한 뒤 `시간 변경`을 눌러주세요. "
+            "자동 삭제 시각도 새 시작 시간의 10시간 후로 바뀌니다."
+        )
+
+    @discord.ui.button(label="시간 변경", style=discord.ButtonStyle.success, row=3)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        scheduled_at, error = parse_party_time(
+            f"{self.selected_date} {self.selected_hour}:{self.selected_minute}"
+        )
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        party_ref = db.collection(PARTY_COLLECTION).document(self.party_id)
+
+        try:
+            async with party_action_lock:
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    update_party_time_transaction,
+                    transaction,
+                    party_ref,
+                    scheduled_at,
+                    utc_now(),
+                )
+
+            if result == "missing":
+                self.stop()
+                await interaction.edit_original_response(
+                    content="❌ 이미 삭제된 파티예요.", view=None
+                )
+                return
+            if result == "closed":
+                self.stop()
+                await interaction.edit_original_response(
+                    content="❌ 선택 중 파티가 시작되어 시간을 변경할 수 없어요.",
+                    view=None,
+                )
+                return
+
+            embed = await build_party_embed(data, self.party_message.guild)
+            refresh_warning = ""
+            try:
+                await self.party_message.edit(embed=embed, view=PartyView(data))
+            except discord.NotFound:
+                await asyncio.to_thread(party_ref.delete)
+                self.stop()
+                await interaction.edit_original_response(
+                    content="❌ 파티 모집글이 삭제되어 변경을 저장하지 않았어요.",
+                    view=None,
+                )
+                return
+            except discord.HTTPException:
+                log.exception("파티 시간 변경 후 모집글 갱신 실패 — party=%s", self.party_id)
+                refresh_warning = "\n⚠️ 시간은 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+
+            self.stop()
+            new_timestamp = int(scheduled_at.timestamp())
+            await interaction.edit_original_response(
+                content=(
+                    f"✅ 파티 시작 시간을 <t:{new_timestamp}:F>로 변경했어요.\n"
+                    "자동 삭제 시각도 함께 갱신했습니다."
+                    f"{refresh_warning}"
+                ),
+                view=None,
+            )
+        except Exception:
+            log.exception("파티 시간 변경 실패 — party=%s", self.party_id)
+            self.stop()
+            await interaction.edit_original_response(
+                content="❌ 파티 시간 변경 중 오류가 발생했어요.", view=None
+            )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="시간 변경을 취소했어요.", view=None)
+
+
 class PartyTypeSelectionView(discord.ui.View):
     def __init__(self, owner_id, name, channel):
         super().__init__(timeout=300)
@@ -1489,14 +1756,6 @@ async def publish_party(interaction, channel, name, scheduled_at, max_members):
 
     try:
         async with party_action_lock:
-            active = await find_active_party_for_member(str(interaction.guild.id), creator_id)
-            if active is not None:
-                await interaction.followup.send(
-                    "❌ 이미 참가 중인 파티가 있어요. 기존 파티에서 나오거나 파티를 삭제한 뒤 다시 만들어주세요.",
-                    ephemeral=True,
-                )
-                return None
-
             now = utc_now()
             data = {
                 "name": name,
@@ -1593,16 +1852,754 @@ async def create_party(
     )
 
 
+# ===== 발쫀컵 이벤트 모집 =====
+
+event_action_lock = asyncio.Lock()
+
+
+def event_status(data, now=None):
+    now = now or utc_now()
+    scheduled_at = as_utc(data.get("scheduled_at"))
+    if data.get("status") == "closed" or scheduled_at is None or now >= scheduled_at:
+        return "closed"
+    return "open"
+
+
+def event_team_progress(member_count):
+    team_count, reserve_count = divmod(member_count, 5)
+    if team_count == 0:
+        return f"완성된 팀 없음 · 1팀까지 {5 - reserve_count}명 남음"
+
+    text = f"{team_count}팀 확정"
+    if reserve_count:
+        text += f" + 후보 {reserve_count}명"
+    text += f" · {team_count + 1}팀까지 {5 - reserve_count}명 남음"
+    return text
+
+
+def event_format_recommendation(member_count):
+    team_count = member_count // 5
+    if team_count < 2:
+        return "2팀 구성을 위해 참가자를 모집 중입니다."
+    if team_count == 2:
+        return "2팀 단판 또는 다전제 경기 권장"
+    if team_count == 3:
+        return "3팀 풀리그 후 상위 2팀 결승 권장"
+    if team_count == 4:
+        return "4강 토너먼트 후 결승 권장"
+    return f"{team_count}팀 예선 후 토너먼트 또는 부전승 방식 권장"
+
+
+def escape_event_text(value):
+    text = str(value or "").strip()
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
+
+
+async def build_event_embed(data, guild):
+    status = event_status(data)
+    status_text = "🟢 모집 중" if status == "open" else "🔴 모집 마감"
+    color = discord.Color(0xF2C94C) if status == "open" else discord.Color.dark_grey()
+    member_ids = [str(user_id) for user_id in data.get("member_ids", [])]
+    creator_id = str(data.get("creator_id", ""))
+    creator_names = await get_party_member_names(guild, [creator_id])
+    scheduled_at = as_utc(data["scheduled_at"])
+    scheduled_timestamp = int(scheduled_at.timestamp())
+
+    rules = escape_event_text(data.get("rules")) or "상세 안내는 운영진 공지를 확인해주세요."
+    prize = escape_event_text(data.get("prize"))
+    member_count = len(member_ids)
+
+    embed = discord.Embed(
+        title=f"🏆 발쫀컵 · {escape_event_text(data['name'])}",
+        description=rules,
+        color=color,
+    )
+    embed.set_author(name="VALJJONJAM SPECIAL EVENT")
+    embed.add_field(name="모집 상태", value=status_text, inline=True)
+    embed.add_field(name="현재 참가", value=f"**{member_count}명**", inline=True)
+    embed.add_field(name="주최", value=creator_names.get(creator_id, "알 수 없는 사용자"), inline=True)
+    embed.add_field(
+        name="경기 시작",
+        value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
+        inline=False,
+    )
+    embed.add_field(name="🎁 상품", value=prize, inline=False)
+
+    if data.get("has_entry_fee"):
+        entry_fee = escape_event_text(data.get("entry_fee"))
+        bank_holder = escape_event_text(data.get("bank_holder"))
+        account_number = escape_event_text(data.get("account_number"))
+        fee_text = (
+            "☑️ **있음**　☐ 없음\n"
+            f"금액: **{entry_fee}**\n"
+            f"은행 / 예금주: **{bank_holder}**\n"
+            f"계좌번호: `{account_number}`\n\n"
+            "⚠️ **경기가 확정되면 입금 부탁드립니다.**"
+        )
+    else:
+        fee_text = "☐ 있음　☑️ **없음**"
+    embed.add_field(name="💳 참가비", value=fee_text, inline=False)
+
+    embed.add_field(
+        name="팀 구성 현황",
+        value=event_team_progress(member_count),
+        inline=False,
+    )
+    embed.add_field(
+        name="권장 진행 방식",
+        value=event_format_recommendation(member_count),
+        inline=False,
+    )
+    embed.set_footer(text="5명 단위로 본선 팀이 구성되며, 나머지 인원은 후보로 표시됩니다.")
+    return embed
+
+
+def get_event_data(event_id):
+    snapshot = db.collection(EVENT_COLLECTION).document(str(event_id)).get()
+    return snapshot.to_dict() if snapshot.exists else None
+
+
+def list_events():
+    return [(doc.id, doc.to_dict()) for doc in db.collection(EVENT_COLLECTION).stream()]
+
+
+@transactional
+def join_event_transaction(transaction, event_ref, user_id, now):
+    snapshot = event_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    if event_status(data, now) == "closed":
+        return "closed", data
+
+    member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
+    if user_id in member_ids:
+        return "already", data
+
+    member_ids.append(user_id)
+    data["member_ids"] = member_ids
+    data["updated_at"] = now
+    transaction.update(event_ref, {"member_ids": member_ids, "updated_at": now})
+    return "joined", data
+
+
+@transactional
+def leave_event_transaction(transaction, event_ref, user_id, now):
+    snapshot = event_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    if event_status(data, now) == "closed":
+        return "closed", data
+
+    member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
+    if user_id not in member_ids:
+        return "not_member", data
+
+    member_ids.remove(user_id)
+    data["member_ids"] = member_ids
+    data["updated_at"] = now
+    transaction.update(event_ref, {"member_ids": member_ids, "updated_at": now})
+    return "left", data
+
+
+@transactional
+def set_event_registration_transaction(transaction, event_ref, target_status, now):
+    snapshot = event_ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return "missing", None
+
+    data = snapshot.to_dict()
+    scheduled_at = as_utc(data.get("scheduled_at"))
+    if scheduled_at is None or now >= scheduled_at:
+        return "started", data
+
+    if data.get("status") == target_status:
+        return f"already_{target_status}", data
+
+    data["status"] = target_status
+    data["updated_at"] = now
+    transaction.update(event_ref, {"status": target_status, "updated_at": now})
+    return target_status, data
+
+
+class EventView(discord.ui.View):
+    def __init__(self, data=None):
+        super().__init__(timeout=None)
+        if data is not None:
+            status = event_status(data)
+            scheduled_at = as_utc(data.get("scheduled_at"))
+            self.join_event.disabled = status != "open"
+            self.leave_event.disabled = status != "open"
+            started = scheduled_at is None or scheduled_at <= utc_now()
+            manually_closed = data.get("status") == "closed"
+            self.close_registration.disabled = started or manually_closed
+            self.reopen_registration.disabled = started or not manually_closed
+
+    @discord.ui.button(
+        label="참가하기",
+        style=discord.ButtonStyle.success,
+        custom_id="event:join",
+        row=0,
+    )
+    async def join_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+        if await block_if_unverified(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        event_id = str(interaction.message.id)
+        user_id = str(interaction.user.id)
+
+        try:
+            async with event_action_lock:
+                event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    join_event_transaction, transaction, event_ref, user_id, utc_now()
+                )
+
+            messages = {
+                "missing": "❌ 이미 삭제된 이벤트예요.",
+                "closed": "❌ 이미 모집이 마감된 이벤트예요.",
+                "already": "ℹ️ 이미 이벤트에 참가하고 있어요.",
+                "joined": "🏆 발쫀컵 참가 신청을 완료했어요!",
+            }
+            refresh_warning = ""
+            if result in {"joined", "closed"} and data is not None:
+                embed = await build_event_embed(data, interaction.guild)
+                refreshed = await try_edit_recruitment_message(
+                    interaction.message, embed, EventView(data), "이벤트", event_id
+                )
+                if result == "joined" and not refreshed:
+                    refresh_warning = "\n⚠️ 참가는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
+        except Exception:
+            log.exception("이벤트 참가 처리 실패 — event=%s user=%s", event_id, user_id)
+            await interaction.followup.send("❌ 이벤트 참가 처리 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="참가 취소",
+        style=discord.ButtonStyle.secondary,
+        custom_id="event:leave",
+        row=0,
+    )
+    async def leave_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        event_id = str(interaction.message.id)
+        user_id = str(interaction.user.id)
+
+        try:
+            async with event_action_lock:
+                event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    leave_event_transaction, transaction, event_ref, user_id, utc_now()
+                )
+
+            messages = {
+                "missing": "❌ 이미 삭제된 이벤트예요.",
+                "closed": "❌ 모집이 마감된 후에는 참가를 취소할 수 없어요.",
+                "not_member": "ℹ️ 이 이벤트에 참가하고 있지 않아요.",
+                "left": "✅ 이벤트 참가를 취소했어요.",
+            }
+            refresh_warning = ""
+            if result in {"left", "closed"} and data is not None:
+                embed = await build_event_embed(data, interaction.guild)
+                refreshed = await try_edit_recruitment_message(
+                    interaction.message, embed, EventView(data), "이벤트", event_id
+                )
+                if result == "left" and not refreshed:
+                    refresh_warning = "\n⚠️ 취소는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
+        except Exception:
+            log.exception("이벤트 참가 취소 실패 — event=%s user=%s", event_id, user_id)
+            await interaction.followup.send("❌ 이벤트 참가 취소 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="참가자 보기",
+        style=discord.ButtonStyle.primary,
+        custom_id="event:members",
+        row=0,
+    )
+    async def show_event_members(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        event_id = str(interaction.message.id)
+        try:
+            data = await asyncio.to_thread(get_event_data, event_id)
+            if data is None:
+                await interaction.followup.send("❌ 이미 삭제된 이벤트예요.", ephemeral=True)
+                return
+
+            member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
+            if not member_ids:
+                await interaction.followup.send("아직 참가자가 없어요.", ephemeral=True)
+                return
+
+            names = await get_party_member_names(interaction.guild, member_ids)
+            lines = [f"{index}. {names[member_id]} (`{member_id}`)" for index, member_id in enumerate(member_ids, 1)]
+            await send_ephemeral_log(
+                interaction,
+                f"🏆 **{escape_event_text(data['name'])} 참가자 · {len(member_ids)}명**",
+                lines,
+            )
+        except Exception:
+            log.exception("이벤트 참가자 조회 실패 — event=%s", event_id)
+            await interaction.followup.send("❌ 참가자 명단을 불러오지 못했어요.", ephemeral=True)
+
+    async def set_registration_status(self, interaction, target_status):
+        if await block_if_not_in_guild(interaction):
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 모집 상태를 변경할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        event_id = str(interaction.message.id)
+        try:
+            async with event_action_lock:
+                event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                transaction = db.transaction()
+                result, data = await asyncio.to_thread(
+                    set_event_registration_transaction,
+                    transaction,
+                    event_ref,
+                    target_status,
+                    utc_now(),
+                )
+
+            messages = {
+                "missing": "❌ 이미 삭제된 이벤트예요.",
+                "started": "❌ 이미 경기 시각이 지나 모집 상태를 변경할 수 없어요.",
+                "open": "✅ 이벤트 모집을 재개했어요.",
+                "closed": "🔒 이벤트 모집을 마감했어요.",
+                "already_open": "ℹ️ 이미 모집 중인 이벤트예요.",
+                "already_closed": "ℹ️ 이미 모집이 마감된 이벤트예요.",
+            }
+            refresh_warning = ""
+            if result in {"open", "closed"}:
+                embed = await build_event_embed(data, interaction.guild)
+                refreshed = await try_edit_recruitment_message(
+                    interaction.message, embed, EventView(data), "이벤트", event_id
+                )
+                if not refreshed:
+                    refresh_warning = "\n⚠️ DB에는 반영됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
+        except Exception:
+            log.exception("이벤트 모집 상태 변경 실패 — event=%s", event_id)
+            await interaction.followup.send("❌ 모집 상태 변경 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="모집 마감",
+        style=discord.ButtonStyle.danger,
+        custom_id="event:close",
+        row=1,
+    )
+    async def close_registration(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.set_registration_status(interaction, "closed")
+
+    @discord.ui.button(
+        label="모집 재개",
+        style=discord.ButtonStyle.success,
+        custom_id="event:reopen",
+        row=1,
+    )
+    async def reopen_registration(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.set_registration_status(interaction, "open")
+
+    @discord.ui.button(
+        label="이벤트 삭제",
+        style=discord.ButtonStyle.danger,
+        custom_id="event:delete",
+        row=1,
+    )
+    async def delete_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 이벤트를 삭제할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        event_id = str(interaction.message.id)
+        event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+        try:
+            async with event_action_lock:
+                try:
+                    await interaction.message.delete()
+                except discord.NotFound:
+                    pass
+                await asyncio.to_thread(event_ref.delete)
+            await interaction.followup.send("🗑️ 발쫀컵 모집글을 삭제했어요.", ephemeral=True)
+        except Exception:
+            log.exception("이벤트 삭제 실패 — event=%s", event_id)
+            await interaction.followup.send("❌ 이벤트 삭제 중 오류가 발생했어요.", ephemeral=True)
+
+
+class EventFeeSelectionView(discord.ui.View):
+    def __init__(self, owner_id, name, channel):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.name = name
+        self.channel = channel
+        self.started = False
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message(
+                "❌ 이 이벤트 생성 화면을 연 관리자만 사용할 수 있어요.", ephemeral=True
+            )
+            return False
+        if self.started:
+            await interaction.response.send_message(
+                "ℹ️ 이미 상세 정보 입력창을 열었어요. 다시 시작하려면 `/이벤트생성`을 실행해주세요.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="참가비 없음", style=discord.ButtonStyle.secondary)
+    async def no_entry_fee(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.started = True
+        await interaction.response.send_modal(
+            EventDetailsModal(self.owner_id, self.name, self.channel, has_entry_fee=False)
+        )
+
+    @discord.ui.button(label="참가비 있음", style=discord.ButtonStyle.success)
+    async def has_entry_fee(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.started = True
+        await interaction.response.send_modal(
+            EventDetailsModal(self.owner_id, self.name, self.channel, has_entry_fee=True)
+        )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="이벤트 생성을 취소했어요.", view=None)
+
+
+class EventDetailsModal(discord.ui.Modal):
+    def __init__(self, owner_id, name, channel, has_entry_fee):
+        super().__init__(title="발쫀컵 상세 정보", timeout=300)
+        self.owner_id = str(owner_id)
+        self.name = name
+        self.channel = channel
+        self.has_entry_fee = has_entry_fee
+
+        self.prize = discord.ui.TextInput(
+            label="상품",
+            placeholder="예: 우승팀 치킨 기프티콘",
+            max_length=200,
+        )
+        self.add_item(self.prize)
+
+        if has_entry_fee:
+            self.entry_fee = discord.ui.TextInput(
+                label="참가비",
+                placeholder="예: 1인 5,000원",
+                max_length=100,
+            )
+            self.bank_holder = discord.ui.TextInput(
+                label="은행 / 예금주",
+                placeholder="예: 카카오뱅크 / 홍길동",
+                max_length=100,
+            )
+            self.account_number = discord.ui.TextInput(
+                label="계좌번호",
+                placeholder="예: 3333-00-0000000",
+                max_length=100,
+            )
+            self.add_item(self.entry_fee)
+            self.add_item(self.bank_holder)
+            self.add_item(self.account_number)
+        else:
+            self.entry_fee = None
+            self.bank_holder = None
+            self.account_number = None
+
+        self.rules = discord.ui.TextInput(
+            label="안내 / 규칙 (선택)",
+            placeholder="예: 팀은 모집 마감 후 공개합니다.",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.rules)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        details = {
+            "prize": self.prize.value.strip(),
+            "has_entry_fee": self.has_entry_fee,
+            "entry_fee": self.entry_fee.value.strip() if self.entry_fee else None,
+            "bank_holder": self.bank_holder.value.strip() if self.bank_holder else None,
+            "account_number": self.account_number.value.strip() if self.account_number else None,
+            "rules": self.rules.value.strip(),
+        }
+        required_values = [details["prize"]]
+        if self.has_entry_fee:
+            required_values.extend(
+                [details["entry_fee"], details["bank_holder"], details["account_number"]]
+            )
+        if not all(required_values):
+            await interaction.response.send_message(
+                "❌ 필수 항목은 공백으로만 입력할 수 없어요. `/이벤트생성`부터 다시 진행해주세요.",
+                ephemeral=True,
+            )
+            return
+        view = EventCreationView(
+            self.owner_id,
+            self.name,
+            self.channel,
+            details,
+        )
+        await interaction.response.send_message(
+            view.render_content(),
+            view=view,
+            ephemeral=True,
+        )
+
+
+class EventCreationView(discord.ui.View):
+    def __init__(self, owner_id, name, channel, details):
+        super().__init__(timeout=300)
+        self.owner_id = str(owner_id)
+        self.name = name
+        self.channel = channel
+        self.details = details
+        self.selected_date = None
+        self.selected_hour = None
+        self.selected_minute = None
+        self.submitting = False
+        self.add_item(
+            PartyCreationSelect(self, "selected_date", "날짜 선택", make_event_date_options(), row=0)
+        )
+        self.add_item(
+            PartyCreationSelect(self, "selected_hour", "시간 선택", make_party_hour_options(), row=1)
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
+                "selected_minute",
+                "분 선택",
+                make_party_minute_options(),
+                row=2,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "❌ 이 이벤트 생성 화면을 연 관리자만 사용할 수 있어요.", ephemeral=True
+        )
+        return False
+
+    def render_content(self):
+        date_text = "선택 전"
+        if self.selected_date:
+            target = datetime.strptime(self.selected_date, "%Y-%m-%d")
+            date_text = f"{target.month}월 {target.day}일"
+        time_text = "선택 전"
+        if self.selected_hour is not None and self.selected_minute is not None:
+            time_text = f"{self.selected_hour}:{self.selected_minute}"
+        fee_text = (
+            "☑️ 있음　☐ 없음"
+            if self.details["has_entry_fee"]
+            else "☐ 있음　☑️ 없음"
+        )
+        return (
+            f"🏆 **발쫀컵 · {escape_event_text(self.name)}** 생성\n"
+            f"• 상품: **{escape_event_text(self.details['prize'])}**\n"
+            f"• 참가비: **{fee_text}**\n"
+            f"• 날짜: **{date_text}**\n"
+            f"• 시간: **{time_text}**\n\n"
+            "날짜·시간을 선택한 뒤 `이벤트 생성`을 눌러주세요."
+        )
+
+    @discord.ui.button(label="이벤트 생성", style=discord.ButtonStyle.success, row=3)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.submitting:
+            await interaction.response.send_message(
+                "ℹ️ 이벤트 모집글을 이미 생성하고 있어요.", ephemeral=True
+            )
+            return
+        if not all((self.selected_date, self.selected_hour, self.selected_minute)):
+            await interaction.response.send_message(
+                "❌ 날짜와 시간을 모두 선택해주세요.", ephemeral=True
+            )
+            return
+
+        scheduled_at, error = parse_event_time(
+            f"{self.selected_date} {self.selected_hour}:{self.selected_minute}"
+        )
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        self.submitting = True
+        await interaction.response.defer()
+        message = await publish_event(
+            interaction,
+            self.channel,
+            self.name,
+            scheduled_at,
+            self.details,
+        )
+        if message is None:
+            self.submitting = False
+            return
+
+        self.stop()
+        await interaction.edit_original_response(
+            content=f"✅ 발쫀컵 모집글을 만들었어요! {message.jump_url}",
+            view=None,
+        )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="이벤트 생성을 취소했어요.", view=None)
+
+
+async def publish_event(interaction, channel, name, scheduled_at, details):
+    creator_id = str(interaction.user.id)
+    event_ref = None
+    try:
+        async with event_action_lock:
+            now = utc_now()
+            data = {
+                "name": name,
+                "creator_id": creator_id,
+                "member_ids": [],
+                "guild_id": str(interaction.guild.id),
+                "channel_id": str(channel.id),
+                "scheduled_at": scheduled_at,
+                "prize": details["prize"],
+                "has_entry_fee": details["has_entry_fee"],
+                "entry_fee": details["entry_fee"],
+                "bank_holder": details["bank_holder"],
+                "account_number": details["account_number"],
+                "rules": details["rules"],
+                "created_at": now,
+                "updated_at": now,
+                "status": "open",
+            }
+            embed = await build_event_embed(data, interaction.guild)
+            message = await channel.send(embed=embed)
+            data["message_id"] = str(message.id)
+            event_ref = db.collection(EVENT_COLLECTION).document(str(message.id))
+            try:
+                await asyncio.to_thread(event_ref.set, data)
+                await message.edit(embed=embed, view=EventView(data))
+            except Exception:
+                await asyncio.to_thread(event_ref.delete)
+                try:
+                    await message.delete()
+                except discord.NotFound:
+                    pass
+                raise
+        return message
+    except Exception:
+        log.exception("이벤트 생성 실패 — creator=%s", creator_id)
+        await interaction.followup.send("❌ 이벤트 생성 중 오류가 발생했어요.", ephemeral=True)
+        return None
+
+
+@bot.tree.command(name="이벤트생성", description="(어드민) 상품이 걸린 발쫀컵 모집글을 생성합니다")
+@app_commands.describe(이벤트이름="이벤트 이름 (최대 50자)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def create_event(
+    interaction: discord.Interaction,
+    이벤트이름: app_commands.Range[str, 1, 50],
+):
+    if await block_if_not_in_guild(interaction):
+        return
+
+    name = 이벤트이름.strip()
+    if not name:
+        await interaction.response.send_message("❌ 이벤트 이름을 입력해주세요.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    channel_id = await asyncio.to_thread(get_party_channel_id, interaction.guild.id)
+    if channel_id is None:
+        await interaction.followup.send(
+            "❌ 모집 채널이 아직 설정되지 않았어요. "
+            "`/파티채널설정`을 먼저 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.guild.get_channel(int(channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            "❌ 설정된 모집 채널을 찾을 수 없어요. 재설정해주세요.", ephemeral=True
+        )
+        return
+    if interaction.channel_id != channel.id:
+        await interaction.followup.send(
+            f"❌ `/이벤트생성`은 지정된 모집 채널 {channel.mention}에서만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return
+
+    permissions = channel.permissions_for(interaction.guild.me)
+    if not permissions.send_messages or not permissions.embed_links:
+        await interaction.followup.send(
+            f"❌ 봇에게 {channel.mention} 채널의 메시지 전송 및 링크 첨부 권한을 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"🏆 **발쫀컵 · {escape_event_text(name)}**의 참가비 여부를 선택해주세요.\n"
+        "참가비가 있으면 입력한 은행·예금주·계좌번호가 모집글에 공개됩니다.",
+        view=EventFeeSelectionView(interaction.user.id, name, channel),
+        ephemeral=True,
+    )
+
+
+@create_event.error
+async def create_event_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+
+
+async def delete_recruitment_documents(message_id):
+    for collection_name in (PARTY_COLLECTION, EVENT_COLLECTION):
+        document_ref = db.collection(collection_name).document(str(message_id))
+        try:
+            snapshot = await asyncio.to_thread(document_ref.get)
+            if snapshot.exists:
+                await asyncio.to_thread(document_ref.delete)
+        except Exception:
+            log.exception(
+                "삭제된 모집글 DB 정리 실패 — collection=%s message=%s",
+                collection_name,
+                message_id,
+            )
+
+
 @bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
-    # 관리자 등이 모집글을 직접 삭제한 경우 남은 DB 데이터가 참가를 막지 않도록 함께 정리
-    party_ref = db.collection(PARTY_COLLECTION).document(str(payload.message_id))
-    try:
-        snapshot = await asyncio.to_thread(party_ref.get)
-        if snapshot.exists:
-            await asyncio.to_thread(party_ref.delete)
-    except Exception:
-        log.exception("삭제된 파티 모집글 DB 정리 실패 — message=%s", payload.message_id)
+    # 관리자 등이 모집글을 직접 삭제한 경우 남은 DB 데이터도 함께 정리
+    await delete_recruitment_documents(payload.message_id)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    for message_id in payload.message_ids:
+        await delete_recruitment_documents(message_id)
 
 
 async def get_party_message(data):
@@ -1636,6 +2633,42 @@ async def refresh_party_messages():
             log.error("기존 파티 모집글 갱신 권한 없음 — party=%s", party_id)
         except Exception:
             log.exception("기존 파티 모집글 갱신 실패 — party=%s", party_id)
+
+
+async def get_event_message(data):
+    guild = bot.get_guild(int(data["guild_id"]))
+    if guild is None:
+        return None, "guild_missing"
+    channel = guild.get_channel(int(data["channel_id"]))
+    if channel is None:
+        return None, "channel_missing"
+    try:
+        return await channel.fetch_message(int(data["message_id"])), None
+    except discord.NotFound:
+        return None, "message_missing"
+
+
+async def refresh_event_messages():
+    try:
+        events = await asyncio.to_thread(list_events)
+    except Exception:
+        log.exception("기존 이벤트 모집글 목록 조회 실패")
+        return
+
+    for event_id, data in events:
+        try:
+            message, reason = await get_event_message(data)
+            if message is not None:
+                embed = await build_event_embed(data, message.guild)
+                await message.edit(embed=embed, view=EventView(data))
+            elif reason in {"channel_missing", "message_missing"}:
+                await asyncio.to_thread(
+                    db.collection(EVENT_COLLECTION).document(event_id).delete
+                )
+        except discord.Forbidden:
+            log.error("기존 이벤트 모집글 갱신 권한 없음 — event=%s", event_id)
+        except Exception:
+            log.exception("기존 이벤트 모집글 갱신 실패 — event=%s", event_id)
 
 
 @tasks.loop(minutes=5)
@@ -1683,8 +2716,52 @@ async def cleanup_parties():
             log.exception("파티 자동 정리 실패 — party=%s", party_id)
 
 
+@tasks.loop(minutes=1)
+async def close_started_events():
+    try:
+        events = await asyncio.to_thread(list_events)
+    except Exception:
+        log.exception("이벤트 자동 마감 목록 조회 실패")
+        return
+
+    now = utc_now()
+    for event_id, data in events:
+        try:
+            scheduled_at = as_utc(data.get("scheduled_at"))
+            if (
+                scheduled_at is None
+                or now < scheduled_at
+                or data.get("status") == "closed"
+            ):
+                continue
+
+            data["status"] = "closed"
+            data["updated_at"] = now
+            event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+            await asyncio.to_thread(
+                event_ref.update,
+                {"status": "closed", "updated_at": now},
+            )
+
+            message, reason = await get_event_message(data)
+            if message is not None:
+                embed = await build_event_embed(data, message.guild)
+                await message.edit(embed=embed, view=EventView(data))
+            elif reason in {"channel_missing", "message_missing"}:
+                await asyncio.to_thread(event_ref.delete)
+        except discord.Forbidden:
+            log.error("이벤트 자동 마감 권한 없음 — event=%s", event_id)
+        except Exception:
+            log.exception("이벤트 자동 마감 실패 — event=%s", event_id)
+
+
 @cleanup_parties.before_loop
 async def before_cleanup_parties():
+    await bot.wait_until_ready()
+
+
+@close_started_events.before_loop
+async def before_close_started_events():
     await bot.wait_until_ready()
 
 
