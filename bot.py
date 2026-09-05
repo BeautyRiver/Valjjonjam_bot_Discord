@@ -91,6 +91,7 @@ VERIFIED_ROLE = "인증됨"
 # 파티 모집 설정
 PARTY_COLLECTION = "parties"
 EVENT_COLLECTION = "events"
+TOOLKIT_RECRUITMENT_COLLECTION = "toolkit_recruitments"
 GUILD_SETTINGS_COLLECTION = "guild_settings"
 PARTY_MAX_MEMBERS = 5
 INHOUSE_PARTY_MAX_MEMBERS = 10
@@ -185,6 +186,9 @@ async def on_ready():
         bot.add_view(EventView())
         bot.event_view_registered = True
         await refresh_event_messages()
+    if not getattr(bot, "toolkit_recruitments_backfilled", False):
+        if await backfill_toolkit_recruitments():
+            bot.toolkit_recruitments_backfilled = True
     if not cleanup_parties.is_running():
         cleanup_parties.start()
     if not close_started_events.is_running():
@@ -1073,9 +1077,15 @@ class PartyView(discord.ui.View):
         try:
             async with party_action_lock:
                 party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+                mirror_ref = get_toolkit_recruitment_ref("party", party_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
-                    join_party_transaction, transaction, party_ref, user_id, utc_now()
+                    join_party_transaction,
+                    transaction,
+                    party_ref,
+                    mirror_ref,
+                    user_id,
+                    utc_now(),
                 )
 
             messages = {
@@ -1114,9 +1124,15 @@ class PartyView(discord.ui.View):
         try:
             async with party_action_lock:
                 party_ref = db.collection(PARTY_COLLECTION).document(party_id)
+                mirror_ref = get_toolkit_recruitment_ref("party", party_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
-                    leave_party_transaction, transaction, party_ref, user_id, utc_now()
+                    leave_party_transaction,
+                    transaction,
+                    party_ref,
+                    mirror_ref,
+                    user_id,
+                    utc_now(),
                 )
 
             messages = {
@@ -1220,7 +1236,9 @@ class PartyView(discord.ui.View):
                     await interaction.message.delete()
                 except discord.NotFound:
                     pass
-                await asyncio.to_thread(party_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair, party_ref, "party", party_id
+                )
             await interaction.followup.send("🗑️ 파티 모집글을 삭제했어요.", ephemeral=True)
         except Exception:
             log.exception("파티 삭제 실패 — party=%s", party_id)
@@ -1237,7 +1255,7 @@ def list_parties():
 
 
 @transactional
-def join_party_transaction(transaction, party_ref, user_id, now):
+def join_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
     snapshot = party_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -1265,11 +1283,15 @@ def join_party_transaction(transaction, party_ref, user_id, now):
             "updated_at": now,
         },
     )
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("party", party_ref.id, data, now),
+    )
     return "joined", data
 
 
 @transactional
-def leave_party_transaction(transaction, party_ref, user_id, now):
+def leave_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
     snapshot = party_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -1296,11 +1318,15 @@ def leave_party_transaction(transaction, party_ref, user_id, now):
             "updated_at": now,
         },
     )
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("party", party_ref.id, data, now),
+    )
     return "left", data
 
 
 @transactional
-def update_party_time_transaction(transaction, party_ref, scheduled_at, now):
+def update_party_time_transaction(transaction, party_ref, mirror_ref, scheduled_at, now):
     snapshot = party_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -1328,6 +1354,10 @@ def update_party_time_transaction(transaction, party_ref, scheduled_at, now):
             "status": status,
             "updated_at": now,
         },
+    )
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("party", party_ref.id, data, now),
     )
     return "updated", data
 
@@ -1646,6 +1676,7 @@ class PartyTimeEditView(discord.ui.View):
 
         await interaction.response.defer()
         party_ref = db.collection(PARTY_COLLECTION).document(self.party_id)
+        mirror_ref = get_toolkit_recruitment_ref("party", self.party_id)
 
         try:
             async with party_action_lock:
@@ -1654,6 +1685,7 @@ class PartyTimeEditView(discord.ui.View):
                     update_party_time_transaction,
                     transaction,
                     party_ref,
+                    mirror_ref,
                     scheduled_at,
                     utc_now(),
                 )
@@ -1677,7 +1709,9 @@ class PartyTimeEditView(discord.ui.View):
             try:
                 await self.party_message.edit(embed=embed, view=PartyView(data))
             except discord.NotFound:
-                await asyncio.to_thread(party_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair, party_ref, "party", self.party_id
+                )
                 self.stop()
                 await interaction.edit_original_response(
                     content="❌ 파티 모집글이 삭제되어 변경을 저장하지 않았어요.",
@@ -1777,10 +1811,21 @@ async def publish_party(interaction, channel, name, scheduled_at, max_members):
             data["message_id"] = str(message.id)
             party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
             try:
-                await asyncio.to_thread(party_ref.set, data)
+                await asyncio.to_thread(
+                    set_recruitment_pair,
+                    party_ref,
+                    "party",
+                    str(message.id),
+                    data,
+                )
                 await message.edit(embed=embed, view=PartyView(data))
             except Exception:
-                await asyncio.to_thread(party_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair,
+                    party_ref,
+                    "party",
+                    str(message.id),
+                )
                 try:
                     await message.delete()
                 except discord.NotFound:
@@ -1864,6 +1909,62 @@ def event_status(data, now=None):
     if data.get("status") == "closed" or scheduled_at is None or now >= scheduled_at:
         return "closed"
     return "open"
+
+
+def get_toolkit_recruitment_ref(kind, source_id):
+    document_id = f"{kind}_{source_id}"
+    return db.collection(TOOLKIT_RECRUITMENT_COLLECTION).document(document_id)
+
+
+def build_toolkit_recruitment_data(kind, source_id, data, now=None):
+    if kind == "party":
+        status = party_status(data, now)
+        max_members = party_max_members(data)
+    elif kind == "event":
+        status = event_status(data, now)
+        max_members = None
+    else:
+        raise ValueError(f"지원하지 않는 모집 유형입니다: {kind}")
+
+    return {
+        "kind": kind,
+        "source_id": str(source_id),
+        "guild_id": str(data.get("guild_id", "")),
+        "name": str(data.get("name", "")),
+        "scheduled_at": as_utc(data.get("scheduled_at")),
+        "status": status,
+        "max_members": max_members,
+        "member_ids": [str(member_id) for member_id in data.get("member_ids", [])],
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def set_recruitment_pair(source_ref, kind, source_id, data):
+    batch = db.batch()
+    batch.set(source_ref, data)
+    batch.set(
+        get_toolkit_recruitment_ref(kind, source_id),
+        build_toolkit_recruitment_data(kind, source_id, data),
+    )
+    batch.commit()
+
+
+def update_recruitment_pair(source_ref, updates, kind, source_id, data):
+    batch = db.batch()
+    batch.update(source_ref, updates)
+    batch.set(
+        get_toolkit_recruitment_ref(kind, source_id),
+        build_toolkit_recruitment_data(kind, source_id, data),
+    )
+    batch.commit()
+
+
+def delete_recruitment_pair(source_ref, kind, source_id):
+    batch = db.batch()
+    batch.delete(source_ref)
+    batch.delete(get_toolkit_recruitment_ref(kind, source_id))
+    batch.commit()
 
 
 def event_team_progress(member_count):
@@ -1982,7 +2083,7 @@ def list_events():
 
 
 @transactional
-def join_event_transaction(transaction, event_ref, user_id, now):
+def join_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
     snapshot = event_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -1999,11 +2100,15 @@ def join_event_transaction(transaction, event_ref, user_id, now):
     data["member_ids"] = member_ids
     data["updated_at"] = now
     transaction.update(event_ref, {"member_ids": member_ids, "updated_at": now})
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("event", event_ref.id, data, now),
+    )
     return "joined", data
 
 
 @transactional
-def leave_event_transaction(transaction, event_ref, user_id, now):
+def leave_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
     snapshot = event_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -2020,11 +2125,17 @@ def leave_event_transaction(transaction, event_ref, user_id, now):
     data["member_ids"] = member_ids
     data["updated_at"] = now
     transaction.update(event_ref, {"member_ids": member_ids, "updated_at": now})
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("event", event_ref.id, data, now),
+    )
     return "left", data
 
 
 @transactional
-def set_event_registration_transaction(transaction, event_ref, target_status, now):
+def set_event_registration_transaction(
+    transaction, event_ref, mirror_ref, target_status, now
+):
     snapshot = event_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
@@ -2040,6 +2151,10 @@ def set_event_registration_transaction(transaction, event_ref, target_status, no
     data["status"] = target_status
     data["updated_at"] = now
     transaction.update(event_ref, {"status": target_status, "updated_at": now})
+    transaction.set(
+        mirror_ref,
+        build_toolkit_recruitment_data("event", event_ref.id, data, now),
+    )
     return target_status, data
 
 
@@ -2075,9 +2190,15 @@ class EventView(discord.ui.View):
         try:
             async with event_action_lock:
                 event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                mirror_ref = get_toolkit_recruitment_ref("event", event_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
-                    join_event_transaction, transaction, event_ref, user_id, utc_now()
+                    join_event_transaction,
+                    transaction,
+                    event_ref,
+                    mirror_ref,
+                    user_id,
+                    utc_now(),
                 )
 
             messages = {
@@ -2116,9 +2237,15 @@ class EventView(discord.ui.View):
         try:
             async with event_action_lock:
                 event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                mirror_ref = get_toolkit_recruitment_ref("event", event_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
-                    leave_event_transaction, transaction, event_ref, user_id, utc_now()
+                    leave_event_transaction,
+                    transaction,
+                    event_ref,
+                    mirror_ref,
+                    user_id,
+                    utc_now(),
                 )
 
             messages = {
@@ -2186,11 +2313,13 @@ class EventView(discord.ui.View):
         try:
             async with event_action_lock:
                 event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+                mirror_ref = get_toolkit_recruitment_ref("event", event_id)
                 transaction = db.transaction()
                 result, data = await asyncio.to_thread(
                     set_event_registration_transaction,
                     transaction,
                     event_ref,
+                    mirror_ref,
                     target_status,
                     utc_now(),
                 )
@@ -2256,7 +2385,9 @@ class EventView(discord.ui.View):
                     await interaction.message.delete()
                 except discord.NotFound:
                     pass
-                await asyncio.to_thread(event_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair, event_ref, "event", event_id
+                )
             await interaction.followup.send("🗑️ 발쫀컵 모집글을 삭제했어요.", ephemeral=True)
         except Exception:
             log.exception("이벤트 삭제 실패 — event=%s", event_id)
@@ -2516,10 +2647,21 @@ async def publish_event(interaction, channel, name, scheduled_at, details):
             data["message_id"] = str(message.id)
             event_ref = db.collection(EVENT_COLLECTION).document(str(message.id))
             try:
-                await asyncio.to_thread(event_ref.set, data)
+                await asyncio.to_thread(
+                    set_recruitment_pair,
+                    event_ref,
+                    "event",
+                    str(message.id),
+                    data,
+                )
                 await message.edit(embed=embed, view=EventView(data))
             except Exception:
-                await asyncio.to_thread(event_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair,
+                    event_ref,
+                    "event",
+                    str(message.id),
+                )
                 try:
                     await message.delete()
                 except discord.NotFound:
@@ -2593,19 +2735,67 @@ async def create_event_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
-async def delete_recruitment_documents(message_id):
-    for collection_name in (PARTY_COLLECTION, EVENT_COLLECTION):
-        document_ref = db.collection(collection_name).document(str(message_id))
-        try:
-            snapshot = await asyncio.to_thread(document_ref.get)
-            if snapshot.exists:
-                await asyncio.to_thread(document_ref.delete)
-        except Exception:
-            log.exception(
-                "삭제된 모집글 DB 정리 실패 — collection=%s message=%s",
-                collection_name,
-                message_id,
+def backfill_toolkit_recruitments_sync():
+    now = utc_now()
+    batch = db.batch()
+    pending = 0
+    total = 0
+
+    for collection_name, kind in (
+        (PARTY_COLLECTION, "party"),
+        (EVENT_COLLECTION, "event"),
+    ):
+        for document in db.collection(collection_name).stream():
+            batch.set(
+                get_toolkit_recruitment_ref(kind, document.id),
+                build_toolkit_recruitment_data(kind, document.id, document.to_dict(), now),
             )
+            pending += 1
+            total += 1
+            if pending >= 400:
+                batch.commit()
+                batch = db.batch()
+                pending = 0
+
+    if pending:
+        batch.commit()
+    return total
+
+
+async def backfill_toolkit_recruitments():
+    try:
+        total = await asyncio.to_thread(backfill_toolkit_recruitments_sync)
+        log.info("툴킷 모집 미러 백필 완료 — %s건", total)
+        return True
+    except Exception:
+        log.exception("툴킷 모집 미러 백필 실패")
+        return False
+
+
+async def delete_recruitment_documents(message_id):
+    def delete_existing_documents():
+        existing = []
+        for collection_name, kind in (
+            (PARTY_COLLECTION, "party"),
+            (EVENT_COLLECTION, "event"),
+        ):
+            source_ref = db.collection(collection_name).document(str(message_id))
+            if source_ref.get().exists:
+                existing.append((source_ref, kind))
+
+        if not existing:
+            return
+
+        batch = db.batch()
+        for source_ref, kind in existing:
+            batch.delete(source_ref)
+            batch.delete(get_toolkit_recruitment_ref(kind, message_id))
+        batch.commit()
+
+    try:
+        await asyncio.to_thread(delete_existing_documents)
+    except Exception:
+        log.exception("삭제된 모집글 DB 정리 실패 — message=%s", message_id)
 
 
 @bot.event
@@ -2681,7 +2871,10 @@ async def refresh_event_messages():
                 await message.edit(embed=embed, view=EventView(data))
             elif reason in {"channel_missing", "message_missing"}:
                 await asyncio.to_thread(
-                    db.collection(EVENT_COLLECTION).document(event_id).delete
+                    delete_recruitment_pair,
+                    db.collection(EVENT_COLLECTION).document(event_id),
+                    "event",
+                    event_id,
                 )
         except discord.Forbidden:
             log.error("기존 이벤트 모집글 갱신 권한 없음 — event=%s", event_id)
@@ -2712,22 +2905,31 @@ async def cleanup_parties():
                 if message is not None:
                     await message.delete()
                 if reason != "guild_missing":
-                    await asyncio.to_thread(party_ref.delete)
+                    await asyncio.to_thread(
+                        delete_recruitment_pair, party_ref, "party", party_id
+                    )
                 continue
 
             if now >= scheduled_at and data.get("status") != "closed":
                 data["status"] = "closed"
                 data["updated_at"] = now
+                updates = {"status": "closed", "updated_at": now}
                 await asyncio.to_thread(
-                    party_ref.update,
-                    {"status": "closed", "updated_at": now},
+                    update_recruitment_pair,
+                    party_ref,
+                    updates,
+                    "party",
+                    party_id,
+                    data,
                 )
                 message, reason = await get_party_message(data)
                 if message is not None:
                     embed = await build_party_embed(data, message.guild)
                     await message.edit(embed=embed, view=PartyView(data))
                 elif reason in {"channel_missing", "message_missing"}:
-                    await asyncio.to_thread(party_ref.delete)
+                    await asyncio.to_thread(
+                        delete_recruitment_pair, party_ref, "party", party_id
+                    )
         except discord.Forbidden:
             log.error("파티 모집글 정리 권한 없음 — party=%s", party_id)
         except Exception:
@@ -2756,9 +2958,14 @@ async def close_started_events():
             data["status"] = "closed"
             data["updated_at"] = now
             event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+            updates = {"status": "closed", "updated_at": now}
             await asyncio.to_thread(
-                event_ref.update,
-                {"status": "closed", "updated_at": now},
+                update_recruitment_pair,
+                event_ref,
+                updates,
+                "event",
+                event_id,
+                data,
             )
 
             message, reason = await get_event_message(data)
@@ -2766,7 +2973,9 @@ async def close_started_events():
                 embed = await build_event_embed(data, message.guild)
                 await message.edit(embed=embed, view=EventView(data))
             elif reason in {"channel_missing", "message_missing"}:
-                await asyncio.to_thread(event_ref.delete)
+                await asyncio.to_thread(
+                    delete_recruitment_pair, event_ref, "event", event_id
+                )
         except discord.Forbidden:
             log.error("이벤트 자동 마감 권한 없음 — event=%s", event_id)
         except Exception:
