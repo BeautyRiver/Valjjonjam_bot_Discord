@@ -99,6 +99,7 @@ PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
 EVENT_MAX_LEAD = timedelta(days=14)
+EVENT_PUBLIC_MEMBER_LIMIT = 20
 
 # 인증 역할을 가져오거나 없으면 생성
 async def get_or_create_verified_role(guild):
@@ -1901,7 +1902,9 @@ async def build_event_embed(data, guild):
     color = discord.Color(0xF2C94C) if status == "open" else discord.Color.dark_grey()
     member_ids = [str(user_id) for user_id in data.get("member_ids", [])]
     creator_id = str(data.get("creator_id", ""))
-    creator_names = await get_party_member_names(guild, [creator_id])
+    member_names = await get_party_member_names(
+        guild, member_ids[:EVENT_PUBLIC_MEMBER_LIMIT] + [creator_id]
+    )
     scheduled_at = as_utc(data["scheduled_at"])
     scheduled_timestamp = int(scheduled_at.timestamp())
 
@@ -1917,7 +1920,7 @@ async def build_event_embed(data, guild):
     embed.set_author(name="VALJJONJAM SPECIAL EVENT")
     embed.add_field(name="모집 상태", value=status_text, inline=True)
     embed.add_field(name="현재 참가", value=f"**{member_count}명**", inline=True)
-    embed.add_field(name="주최", value=creator_names.get(creator_id, "알 수 없는 사용자"), inline=True)
+    embed.add_field(name="주최", value=member_names.get(creator_id, "알 수 없는 사용자"), inline=True)
     embed.add_field(
         name="경기 시작",
         value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
@@ -1939,6 +1942,21 @@ async def build_event_embed(data, guild):
     else:
         fee_text = "☐ 있음　☑️ **없음**"
     embed.add_field(name="💳 참가비", value=fee_text, inline=False)
+
+    member_lines = []
+    for index, member_id in enumerate(member_ids[:EVENT_PUBLIC_MEMBER_LIMIT], 1):
+        line = f"{index}. {member_names[member_id]}"
+        if len("\n".join(member_lines + [line])) > 900:
+            break
+        member_lines.append(line)
+    hidden_count = member_count - len(member_lines)
+    if hidden_count:
+        member_lines.append(f"… 외 {hidden_count}명 (`참가자 보기`에서 전체 확인)")
+    embed.add_field(
+        name=f"👥 참가자 명단 ({member_count}명)",
+        value="\n".join(member_lines) if member_lines else "*아직 참가자가 없어요.*",
+        inline=False,
+    )
 
     embed.add_field(
         name="팀 구성 현황",
@@ -2146,7 +2164,7 @@ class EventView(discord.ui.View):
                 return
 
             names = await get_party_member_names(interaction.guild, member_ids)
-            lines = [f"{index}. {names[member_id]} (`{member_id}`)" for index, member_id in enumerate(member_ids, 1)]
+            lines = [f"{index}. {names[member_id]}" for index, member_id in enumerate(member_ids, 1)]
             await send_ephemeral_log(
                 interaction,
                 f"🏆 **{escape_event_text(data['name'])} 참가자 · {len(member_ids)}명**",
