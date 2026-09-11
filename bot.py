@@ -108,6 +108,19 @@ PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
 EVENT_MAX_LEAD = timedelta(days=14)
 EVENT_PUBLIC_MEMBER_LIMIT = 20
+PARTY_PUBLIC_WAITLIST_LIMIT = 20
+PARTY_PREFERRED_TIER_LABELS = {
+    "free": "자유 모집",
+    "unrated": "일반전",
+    "iron_bronze": "아이언~브론즈",
+    "bronze_silver": "브론즈~실버",
+    "silver_gold": "실버~골드",
+    "gold_platinum": "골드~플래티넘",
+    "platinum_diamond": "플래티넘~다이아",
+    "diamond_ascendant": "다이아~초월자",
+    "ascendant_immortal": "초월자~불멸",
+    "immortal_plus": "불멸 이상",
+}
 
 # 인증 역할을 가져오거나 없으면 생성
 async def get_or_create_verified_role(guild):
@@ -960,6 +973,10 @@ def party_type_name(max_members):
     return "내전 파티 (10명)" if max_members == INHOUSE_PARTY_MAX_MEMBERS else "5인 파티"
 
 
+def party_preferred_tier_name(data):
+    return PARTY_PREFERRED_TIER_LABELS.get(data.get("preferred_tier"), "자유 모집")
+
+
 def party_status(data, now=None):
     now = now or utc_now()
     scheduled_at = as_utc(data.get("scheduled_at"))
@@ -991,6 +1008,19 @@ async def get_party_member_names(guild, user_ids):
     return names
 
 
+async def send_party_dm(guild, user_id, content):
+    try:
+        member_id = int(user_id)
+        member = guild.get_member(member_id)
+        if member is None:
+            member = await guild.fetch_member(member_id)
+        await member.send(content)
+        return True
+    except (TypeError, ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.info("파티 알림 DM 전송 실패 — guild=%s user=%s", guild.id, user_id)
+        return False
+
+
 async def try_edit_recruitment_message(message, embed, view, kind, recruitment_id):
     try:
         await message.edit(embed=embed, view=view)
@@ -1005,18 +1035,24 @@ async def build_party_embed(data, guild):
     max_members = party_max_members(data)
     status_text = {
         "open": "🟢 모집 중",
-        "full": "🔴 모집 완료",
+        "full": "🟡 정원 마감 · 대기 접수 중",
         "closed": "⚫ 모집 마감",
     }[status]
     color = {
         "open": discord.Color.green(),
-        "full": discord.Color.red(),
+        "full": discord.Color.gold(),
         "closed": discord.Color.dark_grey(),
     }[status]
 
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
+    waitlist_ids = [
+        str(uid) for uid in data.get("waitlist_ids", []) if str(uid) not in member_ids
+    ]
     creator_id = str(data.get("creator_id", ""))
-    member_names = await get_party_member_names(guild, member_ids + [creator_id])
+    public_waitlist_ids = waitlist_ids[:PARTY_PUBLIC_WAITLIST_LIMIT]
+    member_names = await get_party_member_names(
+        guild, member_ids + public_waitlist_ids + [creator_id]
+    )
     member_lines = []
     for index in range(max_members):
         if index < len(member_ids):
@@ -1039,10 +1075,28 @@ async def build_party_embed(data, guild):
     embed.add_field(name="상태", value=status_text, inline=True)
     embed.add_field(name="모집 유형", value=party_type_name(max_members), inline=True)
     embed.add_field(
-        name="현재 인원",
+        name="참가 확정",
         value=f"**{len(member_ids)} / {max_members}**",
         inline=True,
     )
+    embed.add_field(
+        name="희망 티어대",
+        value=f"**{party_preferred_tier_name(data)}**\n*참가 제한이 아닌 희망 조건입니다.*",
+        inline=False,
+    )
+    if waitlist_ids:
+        waitlist_lines = [
+            f"{index}. {member_names[user_id]}"
+            for index, user_id in enumerate(public_waitlist_ids, 1)
+        ]
+        hidden_count = len(waitlist_ids) - len(public_waitlist_ids)
+        if hidden_count:
+            waitlist_lines.append(f"… 외 {hidden_count}명")
+        embed.add_field(
+            name=f"🕒 대기 명단 ({len(waitlist_ids)}명)",
+            value="\n".join(waitlist_lines),
+            inline=False,
+        )
     embed.add_field(name="파티장", value=member_names[creator_id], inline=True)
     embed.add_field(
         name="파티 시작",
@@ -1054,7 +1108,9 @@ async def build_party_embed(data, guild):
         value=f"<t:{delete_timestamp}:F>\n파티 시작 10시간 후 자동으로 삭제됩니다.",
         inline=False,
     )
-    embed.set_footer(text="다른 파티에도 동시에 참가할 수 있습니다.")
+    embed.set_footer(
+        text="다른 파티에도 동시에 참가할 수 있습니다. 빈자리가 생기면 대기 순서대로 참가가 확정됩니다."
+    )
     return embed
 
 
@@ -1063,7 +1119,8 @@ class PartyView(discord.ui.View):
         super().__init__(timeout=None)
         if data is not None:
             status = party_status(data)
-            self.join_party.disabled = status != "open"
+            self.join_party.disabled = status == "closed"
+            self.join_party.label = "대기 신청" if status == "full" else "참가하기"
             self.leave_party.disabled = status == "closed"
             self.change_party_time.disabled = status == "closed"
 
@@ -1087,7 +1144,7 @@ class PartyView(discord.ui.View):
                 party_ref = db.collection(PARTY_COLLECTION).document(party_id)
                 mirror_ref = get_toolkit_recruitment_ref("party", party_id)
                 transaction = db.transaction()
-                result, data = await asyncio.to_thread(
+                result, data, waitlist_position = await asyncio.to_thread(
                     join_party_transaction,
                     transaction,
                     party_ref,
@@ -1099,12 +1156,13 @@ class PartyView(discord.ui.View):
             messages = {
                 "missing": "❌ 이미 삭제된 파티예요.",
                 "closed": "❌ 모집이 마감된 파티예요.",
-                "full": f"❌ 이미 {party_max_members(data or {})}명이 모두 모였어요.",
-                "already": "ℹ️ 이미 이 파티에 참가하고 있어요.",
-                "joined": "✅ 파티에 참가했어요!",
+                "already_member": "ℹ️ 이미 참가가 확정된 파티예요.",
+                "already_waitlist": "ℹ️ 이미 이 파티의 대기 명단에 있어요.",
+                "joined": "✅ 파티 참가가 확정됐어요!",
+                "waitlisted": f"🕒 대기 명단 {waitlist_position}번으로 등록됐어요. 빈자리가 생기면 자동으로 참가가 확정됩니다.",
             }
             refresh_warning = ""
-            if result == "joined":
+            if result in {"joined", "waitlisted"}:
                 embed = await build_party_embed(data, interaction.guild)
                 refreshed = await try_edit_recruitment_message(
                     interaction.message, embed, PartyView(data), "파티", party_id
@@ -1134,7 +1192,7 @@ class PartyView(discord.ui.View):
                 party_ref = db.collection(PARTY_COLLECTION).document(party_id)
                 mirror_ref = get_toolkit_recruitment_ref("party", party_id)
                 transaction = db.transaction()
-                result, data = await asyncio.to_thread(
+                result, data, promoted_id = await asyncio.to_thread(
                     leave_party_transaction,
                     transaction,
                     party_ref,
@@ -1148,16 +1206,44 @@ class PartyView(discord.ui.View):
                 "closed": "❌ 이미 모집이 마감됐어요.",
                 "creator": "❌ 파티장은 참가를 취소할 수 없어요. `파티 삭제`를 이용해주세요.",
                 "not_member": "ℹ️ 이 파티에 참가하고 있지 않아요.",
-                "left": "✅ 파티 참가를 취소했어요.",
+                "left": "✅ 참가 확정을 취소했어요.",
+                "left_promoted": "✅ 참가 확정을 취소했어요. 대기 1번의 참가가 자동으로 확정됐습니다.",
+                "waitlist_left": "✅ 대기 신청을 취소했어요.",
             }
             refresh_warning = ""
-            if result == "left":
+            if result in {"left", "left_promoted", "waitlist_left"}:
                 embed = await build_party_embed(data, interaction.guild)
                 refreshed = await try_edit_recruitment_message(
                     interaction.message, embed, PartyView(data), "파티", party_id
                 )
                 if not refreshed:
                     refresh_warning = "\n⚠️ 취소는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            if result == "left_promoted" and promoted_id:
+                promoted = await send_party_dm(
+                    interaction.guild,
+                    promoted_id,
+                    (
+                        "🎉 **파티 참가가 확정됐어요!**\n"
+                        f"대기 중이던 **{discord.utils.escape_markdown(discord.utils.escape_mentions(data['name']))}** 파티에 빈자리가 생겨 참가 확정으로 변경됐습니다.\n"
+                        f"• 모집 유형: **{party_type_name(party_max_members(data))}**\n"
+                        f"• 희망 티어대: **{party_preferred_tier_name(data)}**\n"
+                        f"• 시작: <t:{int(as_utc(data['scheduled_at']).timestamp())}:F>\n\n"
+                        "참여가 어렵다면 모집글에서 `참가 취소`를 눌러주세요.\n"
+                        f"{interaction.message.jump_url}"
+                    ),
+                )
+                if not promoted:
+                    try:
+                        await interaction.channel.send(
+                            f"<@{promoted_id}> 대기 명단에서 **참가 확정**으로 변경됐어요! {interaction.message.jump_url}",
+                            allowed_mentions=discord.AllowedMentions(users=True),
+                        )
+                    except discord.HTTPException:
+                        log.exception(
+                            "파티 승격 채널 알림 실패 — party=%s user=%s",
+                            party_id,
+                            promoted_id,
+                        )
             await interaction.followup.send(messages[result] + refresh_warning, ephemeral=True)
         except Exception:
             log.exception("파티 참가 취소 실패 — party=%s user=%s", party_id, user_id)
@@ -1266,27 +1352,40 @@ def list_parties():
 def join_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
     snapshot = party_ref.get(transaction=transaction)
     if not snapshot.exists:
-        return "missing", None
+        return "missing", None, None
 
     data = snapshot.to_dict()
     if party_status(data, now) == "closed":
-        return "closed", data
+        return "closed", data, None
 
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
+    waitlist_ids = [
+        str(uid) for uid in data.get("waitlist_ids", []) if str(uid) not in member_ids
+    ]
     if user_id in member_ids:
-        return "already", data
+        return "already_member", data, None
+    if user_id in waitlist_ids:
+        return "already_waitlist", data, waitlist_ids.index(user_id) + 1
+
     max_members = party_max_members(data)
     if len(member_ids) >= max_members:
-        return "full", data
+        waitlist_ids.append(user_id)
+        result = "waitlisted"
+        waitlist_position = len(waitlist_ids)
+    else:
+        member_ids.append(user_id)
+        result = "joined"
+        waitlist_position = None
 
-    member_ids.append(user_id)
     data["member_ids"] = member_ids
+    data["waitlist_ids"] = waitlist_ids
     data["status"] = "full" if len(member_ids) >= max_members else "open"
     data["updated_at"] = now
     transaction.update(
         party_ref,
         {
             "member_ids": member_ids,
+            "waitlist_ids": waitlist_ids,
             "status": data["status"],
             "updated_at": now,
         },
@@ -1295,34 +1394,51 @@ def join_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
         mirror_ref,
         build_toolkit_recruitment_data("party", party_ref.id, data, now),
     )
-    return "joined", data
+    return result, data, waitlist_position
 
 
 @transactional
 def leave_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
     snapshot = party_ref.get(transaction=transaction)
     if not snapshot.exists:
-        return "missing", None
+        return "missing", None, None
 
     data = snapshot.to_dict()
     if party_status(data, now) == "closed":
-        return "closed", data
+        return "closed", data, None
     if str(data.get("creator_id")) == user_id:
-        return "creator", data
+        return "creator", data, None
 
     member_ids = [str(uid) for uid in data.get("member_ids", [])]
-    if user_id not in member_ids:
-        return "not_member", data
+    waitlist_ids = [
+        str(uid) for uid in data.get("waitlist_ids", []) if str(uid) not in member_ids
+    ]
+    promoted_id = None
 
-    member_ids.remove(user_id)
+    if user_id in waitlist_ids:
+        waitlist_ids.remove(user_id)
+        result = "waitlist_left"
+    elif user_id in member_ids:
+        member_ids.remove(user_id)
+        if waitlist_ids:
+            promoted_id = waitlist_ids.pop(0)
+            member_ids.append(promoted_id)
+            result = "left_promoted"
+        else:
+            result = "left"
+    else:
+        return "not_member", data, None
+
     data["member_ids"] = member_ids
-    data["status"] = "open"
+    data["waitlist_ids"] = waitlist_ids
+    data["status"] = "full" if len(member_ids) >= party_max_members(data) else "open"
     data["updated_at"] = now
     transaction.update(
         party_ref,
         {
             "member_ids": member_ids,
-            "status": "open",
+            "waitlist_ids": waitlist_ids,
+            "status": data["status"],
             "updated_at": now,
         },
     )
@@ -1330,7 +1446,7 @@ def leave_party_transaction(transaction, party_ref, mirror_ref, user_id, now):
         mirror_ref,
         build_toolkit_recruitment_data("party", party_ref.id, data, now),
     )
-    return "left", data
+    return result, data, promoted_id
 
 
 @transactional
@@ -1516,16 +1632,29 @@ class PartyCreationView(discord.ui.View):
         self.name = name
         self.channel = channel
         self.max_members = max_members
+        self.preferred_tier = "free"
         self.selected_date = None
         self.selected_hour = None
         self.selected_minute = None
         self.add_item(
             PartyCreationSelect(
                 self,
+                "preferred_tier",
+                "희망 티어대 선택",
+                [
+                    discord.SelectOption(label=label, value=value)
+                    for value, label in PARTY_PREFERRED_TIER_LABELS.items()
+                ],
+                row=0,
+            )
+        )
+        self.add_item(
+            PartyCreationSelect(
+                self,
                 "selected_date",
                 "날짜 선택",
                 make_party_date_options(),
-                row=0,
+                row=1,
             )
         )
         self.add_item(
@@ -1534,7 +1663,7 @@ class PartyCreationView(discord.ui.View):
                 "selected_hour",
                 "시간 선택",
                 make_party_hour_options(),
-                row=1,
+                row=2,
             )
         )
         self.add_item(
@@ -1543,7 +1672,7 @@ class PartyCreationView(discord.ui.View):
                 "selected_minute",
                 "분 선택",
                 make_party_minute_options(),
-                row=2,
+                row=3,
             )
         )
 
@@ -1568,13 +1697,15 @@ class PartyCreationView(discord.ui.View):
 
         return (
             f"🎮 **{party_type_name(self.max_members)} · {self.name}**의 시작 시간을 선택해주세요.\n"
+            f"• 희망 티어대: **{PARTY_PREFERRED_TIER_LABELS[self.preferred_tier]}**\n"
             f"• 날짜: **{date_text}**\n"
             f"• 시간: **{time_text}**\n\n"
+            "희망 티어대는 참가 제한이 아닌 모집 안내로만 표시됩니다.\n"
             "날짜·시간을 모두 선택한 뒤 `파티 생성`을 눌러주세요. "
             "모집글은 파티 시작 10시간 후 자동으로 삭제됩니다."
         )
 
-    @discord.ui.button(label="파티 생성", style=discord.ButtonStyle.success, row=3)
+    @discord.ui.button(label="파티 생성", style=discord.ButtonStyle.success, row=4)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not all((self.selected_date, self.selected_hour, self.selected_minute)):
             await interaction.response.send_message(
@@ -1591,7 +1722,12 @@ class PartyCreationView(discord.ui.View):
 
         await interaction.response.defer()
         message = await publish_party(
-            interaction, self.channel, self.name, scheduled_at, self.max_members
+            interaction,
+            self.channel,
+            self.name,
+            scheduled_at,
+            self.max_members,
+            self.preferred_tier,
         )
         if message is None:
             return
@@ -1605,7 +1741,7 @@ class PartyCreationView(discord.ui.View):
             view=None,
         )
 
-    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=4)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
@@ -1682,6 +1818,14 @@ class PartyTimeEditView(discord.ui.View):
             await interaction.response.send_message(error, ephemeral=True)
             return
 
+        new_timestamp = int(scheduled_at.timestamp())
+        if new_timestamp == self.current_timestamp:
+            self.stop()
+            await interaction.response.edit_message(
+                content="ℹ️ 기존 시작 시간과 같아서 변경하지 않았어요.", view=None
+            )
+            return
+
         await interaction.response.defer()
         party_ref = db.collection(PARTY_COLLECTION).document(self.party_id)
         mirror_ref = get_toolkit_recruitment_ref("party", self.party_id)
@@ -1730,12 +1874,40 @@ class PartyTimeEditView(discord.ui.View):
                 log.exception("파티 시간 변경 후 모집글 갱신 실패 — party=%s", self.party_id)
                 refresh_warning = "\n⚠️ 시간은 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
 
+            notification_ids = [
+                str(user_id)
+                for user_id in (
+                    list(data.get("member_ids") or [])
+                    + list(data.get("waitlist_ids") or [])
+                )
+                if str(user_id) != str(interaction.user.id)
+            ]
+            dm_content = (
+                "⏰ **파티 시작 시간이 변경됐어요**\n"
+                f"**{discord.utils.escape_markdown(discord.utils.escape_mentions(data['name']))}** 파티의 일정이 변경되었습니다.\n"
+                f"• 이전: <t:{self.current_timestamp}:F>\n"
+                f"• 변경: <t:{new_timestamp}:F>\n\n"
+                "참여가 어렵다면 모집글에서 `참가 취소`를 눌러주세요.\n"
+                f"{self.party_message.jump_url}"
+            )
+            dm_results = await asyncio.gather(
+                *(
+                    send_party_dm(self.party_message.guild, user_id, dm_content)
+                    for user_id in dict.fromkeys(notification_ids)
+                )
+            )
+            dm_success_count = sum(dm_results)
+            dm_failure_count = len(dm_results) - dm_success_count
+            dm_summary = f"\n알림 DM: {dm_success_count}명 전송"
+            if dm_failure_count:
+                dm_summary += f" · {dm_failure_count}명 실패(DM 차단 등)"
+
             self.stop()
-            new_timestamp = int(scheduled_at.timestamp())
             await interaction.edit_original_response(
                 content=(
                     f"✅ 파티 시작 시간을 <t:{new_timestamp}:F>로 변경했어요.\n"
                     "자동 삭제 시각도 함께 갱신했습니다."
+                    f"{dm_summary}"
                     f"{refresh_warning}"
                 ),
                 view=None,
@@ -1775,7 +1947,7 @@ class PartyTypeSelectionView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"🎮 **{party_type_name(max_members)} · {self.name}**을 선택했어요.\n"
-                "이제 시작 날짜와 시간을 선택해주세요."
+                "이제 희망 티어대와 시작 날짜·시간을 선택해주세요."
             ),
             view=view,
         )
@@ -1794,7 +1966,9 @@ class PartyTypeSelectionView(discord.ui.View):
         await interaction.response.edit_message(content="파티 생성을 취소했어요.", view=None)
 
 
-async def publish_party(interaction, channel, name, scheduled_at, max_members):
+async def publish_party(
+    interaction, channel, name, scheduled_at, max_members, preferred_tier="free"
+):
     creator_id = str(interaction.user.id)
 
     try:
@@ -1804,9 +1978,11 @@ async def publish_party(interaction, channel, name, scheduled_at, max_members):
                 "name": name,
                 "creator_id": creator_id,
                 "member_ids": [creator_id],
+                "waitlist_ids": [],
                 "guild_id": str(interaction.guild.id),
                 "channel_id": str(channel.id),
                 "max_members": max_members,
+                "preferred_tier": preferred_tier,
                 "scheduled_at": scheduled_at,
                 "delete_at": scheduled_at + PARTY_DELETE_DELAY,
                 "created_at": now,
@@ -1943,6 +2119,12 @@ def build_toolkit_recruitment_data(kind, source_id, data, now=None):
         "status": status,
         "max_members": max_members,
         "member_ids": [str(member_id) for member_id in data.get("member_ids", [])],
+        "waitlist_ids": (
+            [str(member_id) for member_id in data.get("waitlist_ids", [])]
+            if kind == "party"
+            else []
+        ),
+        "preferred_tier": data.get("preferred_tier", "free") if kind == "party" else None,
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
     }
@@ -1982,7 +2164,7 @@ def event_team_progress(member_count):
 
     text = f"{team_count}팀 확정"
     if reserve_count:
-        text += f" + 후보 {reserve_count}명"
+        text += f" + 대기 {reserve_count}명"
     text += f" · {team_count + 1}팀까지 {5 - reserve_count}명 남음"
     return text
 
@@ -2077,7 +2259,7 @@ async def build_event_embed(data, guild):
         value=event_format_recommendation(member_count),
         inline=False,
     )
-    embed.set_footer(text="5명 단위로 본선 팀이 구성되며, 나머지 인원은 후보로 표시됩니다.")
+    embed.set_footer(text="5명 단위로 팀이 구성되며, 나머지 인원은 대기로 표시됩니다.")
     return embed
 
 
