@@ -1086,11 +1086,12 @@ async def build_party_embed(data, guild):
         value=f"**{len(member_ids)} / {max_members}**",
         inline=True,
     )
-    embed.add_field(
-        name="희망 티어대",
-        value=f"**{party_preferred_tier_name(data)}**\n*참가 제한이 아닌 희망 조건입니다.*",
-        inline=False,
-    )
+    if max_members == PARTY_MAX_MEMBERS:
+        embed.add_field(
+            name="희망 티어대",
+            value=f"**{party_preferred_tier_name(data)}**\n*참가 제한이 아닌 희망 조건입니다.*",
+            inline=False,
+        )
     if waitlist_ids:
         waitlist_lines = [
             f"{index}. {member_names[user_id]}"
@@ -1226,6 +1227,11 @@ class PartyView(discord.ui.View):
                 if not refreshed:
                     refresh_warning = "\n⚠️ 취소는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
             if result == "left_promoted" and promoted_id:
+                tier_text = (
+                    f"• 희망 티어대: **{party_preferred_tier_name(data)}**\n"
+                    if party_max_members(data) == PARTY_MAX_MEMBERS
+                    else ""
+                )
                 promoted = await send_party_dm(
                     interaction.guild,
                     promoted_id,
@@ -1233,7 +1239,7 @@ class PartyView(discord.ui.View):
                         "🎉 **파티 참가가 확정됐어요!**\n"
                         f"대기 중이던 **{discord.utils.escape_markdown(discord.utils.escape_mentions(data['name']))}** 파티에 빈자리가 생겨 참가 확정으로 변경됐습니다.\n"
                         f"• 모집 유형: **{party_type_name(party_max_members(data))}**\n"
-                        f"• 희망 티어대: **{party_preferred_tier_name(data)}**\n"
+                        f"{tier_text}"
                         f"• 시작: <t:{int(as_utc(data['scheduled_at']).timestamp())}:F>\n\n"
                         "참여가 어렵다면 모집글에서 `참가 취소`를 눌러주세요.\n"
                         f"{interaction.message.jump_url}"
@@ -1643,18 +1649,19 @@ class PartyCreationView(discord.ui.View):
         self.selected_date = None
         self.selected_hour = None
         self.selected_minute = None
-        self.add_item(
-            PartyCreationSelect(
-                self,
-                "preferred_tier",
-                "희망 티어대 선택",
-                [
-                    discord.SelectOption(label=label, value=value)
-                    for value, label in PARTY_PREFERRED_TIER_LABELS.items()
-                ],
-                row=0,
+        if self.max_members == PARTY_MAX_MEMBERS:
+            self.add_item(
+                PartyCreationSelect(
+                    self,
+                    "preferred_tier",
+                    "희망 티어대 선택",
+                    [
+                        discord.SelectOption(label=label, value=value)
+                        for value, label in PARTY_PREFERRED_TIER_LABELS.items()
+                    ],
+                    row=0,
+                )
             )
-        )
         self.add_item(
             PartyCreationSelect(
                 self,
@@ -1702,12 +1709,18 @@ class PartyCreationView(discord.ui.View):
         if self.selected_hour is not None and self.selected_minute is not None:
             time_text = f"{self.selected_hour}:{self.selected_minute}"
 
+        tier_text = ""
+        tier_note = ""
+        if self.max_members == PARTY_MAX_MEMBERS:
+            tier_text = f"• 희망 티어대: **{PARTY_PREFERRED_TIER_LABELS[self.preferred_tier]}**\n"
+            tier_note = "희망 티어대는 참가 제한이 아닌 모집 안내로만 표시됩니다.\n"
+
         return (
             f"🎮 **{party_type_name(self.max_members)} · {self.name}**의 시작 시간을 선택해주세요.\n"
-            f"• 희망 티어대: **{PARTY_PREFERRED_TIER_LABELS[self.preferred_tier]}**\n"
+            f"{tier_text}"
             f"• 날짜: **{date_text}**\n"
             f"• 시간: **{time_text}**\n\n"
-            "희망 티어대는 참가 제한이 아닌 모집 안내로만 표시됩니다.\n"
+            f"{tier_note}"
             "날짜·시간을 모두 선택한 뒤 `파티 생성`을 눌러주세요. "
             "모집글은 파티 시작 10시간 후 자동으로 삭제됩니다."
         )
@@ -1952,10 +1965,7 @@ class PartyTypeSelectionView(discord.ui.View):
         self.stop()
         view = PartyCreationView(self.owner_id, self.name, self.channel, max_members)
         await interaction.response.edit_message(
-            content=(
-                f"🎮 **{party_type_name(max_members)} · {self.name}**을 선택했어요.\n"
-                "이제 희망 티어대와 시작 날짜·시간을 선택해주세요."
-            ),
+            content=view.render_content(),
             view=view,
         )
 
