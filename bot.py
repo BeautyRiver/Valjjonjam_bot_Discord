@@ -102,6 +102,7 @@ TOOLKIT_RECRUITMENT_COLLECTION = "toolkit_recruitments"
 GUILD_SETTINGS_COLLECTION = "guild_settings"
 PARTY_MAX_MEMBERS = 5
 INHOUSE_PARTY_MAX_MEMBERS = 10
+GAUNTLET_PARTY_MAX_MEMBERS = 16
 PARTY_TIMEZONE = timezone(timedelta(hours=9))
 PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
@@ -966,10 +967,16 @@ def parse_event_time(value):
 
 def party_max_members(data):
     max_members = data.get("max_members", PARTY_MAX_MEMBERS)
-    return max_members if max_members in {PARTY_MAX_MEMBERS, INHOUSE_PARTY_MAX_MEMBERS} else PARTY_MAX_MEMBERS
+    if max_members in {
+        PARTY_MAX_MEMBERS, INHOUSE_PARTY_MAX_MEMBERS, GAUNTLET_PARTY_MAX_MEMBERS
+    }:
+        return max_members
+    return PARTY_MAX_MEMBERS
 
 
 def party_type_name(max_members):
+    if max_members == GAUNTLET_PARTY_MAX_MEMBERS:
+        return "건틀릿 내전 (16명)"
     return "내전 파티 (10명)" if max_members == INHOUSE_PARTY_MAX_MEMBERS else "5인 파티"
 
 
@@ -1960,6 +1967,10 @@ class PartyTypeSelectionView(discord.ui.View):
     async def inhouse_party(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.select_type(interaction, INHOUSE_PARTY_MAX_MEMBERS)
 
+    @discord.ui.button(label="건틀릿 내전 (16명)", style=discord.ButtonStyle.success)
+    async def gauntlet_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.select_type(interaction, GAUNTLET_PARTY_MAX_MEMBERS)
+
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
@@ -2022,7 +2033,7 @@ async def publish_party(
         return None
 
 
-@bot.tree.command(name="파티생성", description="5인 또는 내전 파티 모집글을 생성합니다")
+@bot.tree.command(name="파티생성", description="5인큐·일반 내전(10명)·건틀릿 내전(16명) 모집글을 생성합니다")
 @app_commands.describe(
     파티이름="파티 이름 (최대 30자)",
 )
@@ -2082,7 +2093,7 @@ async def create_party(
     )
 
 
-# ===== 발쫀컵 이벤트 모집 =====
+# ===== 발쫀전 이벤트 모집 =====
 
 event_action_lock = asyncio.Lock()
 
@@ -2204,7 +2215,7 @@ async def build_event_embed(data, guild):
     member_count = len(member_ids)
 
     embed = discord.Embed(
-        title=f"🏆 발쫀컵 · {escape_event_text(data['name'])}",
+        title=f"🏆 발쫀전 · {escape_event_text(data['name'])}",
         description=rules,
         color=color,
     )
@@ -2395,7 +2406,7 @@ class EventView(discord.ui.View):
                 "missing": "❌ 이미 삭제된 이벤트예요.",
                 "closed": "❌ 이미 모집이 마감된 이벤트예요.",
                 "already": "ℹ️ 이미 이벤트에 참가하고 있어요.",
-                "joined": "🏆 발쫀컵 참가 신청을 완료했어요!",
+                "joined": "🏆 발쫀전 참가 신청을 완료했어요!",
             }
             refresh_warning = ""
             if result in {"joined", "closed"} and data is not None:
@@ -2578,7 +2589,7 @@ class EventView(discord.ui.View):
                 await asyncio.to_thread(
                     delete_recruitment_pair, event_ref, "event", event_id
                 )
-            await interaction.followup.send("🗑️ 발쫀컵 모집글을 삭제했어요.", ephemeral=True)
+            await interaction.followup.send("🗑️ 발쫀전 모집글을 삭제했어요.", ephemeral=True)
         except Exception:
             log.exception("이벤트 삭제 실패 — event=%s", event_id)
             await interaction.followup.send("❌ 이벤트 삭제 중 오류가 발생했어요.", ephemeral=True)
@@ -2628,7 +2639,7 @@ class EventFeeSelectionView(discord.ui.View):
 
 class EventDetailsModal(discord.ui.Modal):
     def __init__(self, owner_id, name, channel, has_entry_fee):
-        super().__init__(title="발쫀컵 상세 정보", timeout=300)
+        super().__init__(title="발쫀전 상세 정보", timeout=300)
         self.owner_id = str(owner_id)
         self.name = name
         self.channel = channel
@@ -2756,7 +2767,7 @@ class EventCreationView(discord.ui.View):
             else "☐ 있음　☑️ 없음"
         )
         return (
-            f"🏆 **발쫀컵 · {escape_event_text(self.name)}** 생성\n"
+            f"🏆 **발쫀전 · {escape_event_text(self.name)}** 생성\n"
             f"• 상품: **{escape_event_text(self.details['prize'])}**\n"
             f"• 참가비: **{fee_text}**\n"
             f"• 날짜: **{date_text}**\n"
@@ -2799,7 +2810,7 @@ class EventCreationView(discord.ui.View):
 
         self.stop()
         await interaction.edit_original_response(
-            content=f"✅ 발쫀컵 모집글을 만들었어요! {message.jump_url}",
+            content=f"✅ 발쫀전 모집글을 만들었어요! {message.jump_url}",
             view=None,
         )
 
@@ -2864,7 +2875,7 @@ async def publish_event(interaction, channel, name, scheduled_at, details):
         return None
 
 
-@bot.tree.command(name="이벤트생성", description="(어드민) 상품이 걸린 발쫀컵 모집글을 생성합니다")
+@bot.tree.command(name="이벤트생성", description="(어드민) 상품이 걸린 발쫀전 모집글을 생성합니다")
 @app_commands.describe(이벤트이름="이벤트 이름 (최대 50자)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -2912,7 +2923,7 @@ async def create_event(
         return
 
     await interaction.followup.send(
-        f"🏆 **발쫀컵 · {escape_event_text(name)}**의 참가비 여부를 선택해주세요.\n"
+        f"🏆 **발쫀전 · {escape_event_text(name)}**의 참가비 여부를 선택해주세요.\n"
         "참가비가 있으면 입력한 은행·예금주·계좌번호가 모집글에 공개됩니다.",
         view=EventFeeSelectionView(interaction.user.id, name, channel),
         ephemeral=True,
