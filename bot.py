@@ -102,7 +102,7 @@ TOOLKIT_RECRUITMENT_COLLECTION = "toolkit_recruitments"
 GUILD_SETTINGS_COLLECTION = "guild_settings"
 PARTY_MAX_MEMBERS = 5
 INHOUSE_PARTY_MAX_MEMBERS = 10
-GAUNTLET_PARTY_MAX_MEMBERS = 16
+SUPPORTED_PARTY_SIZES = {PARTY_MAX_MEMBERS, INHOUSE_PARTY_MAX_MEMBERS}
 PARTY_TIMEZONE = timezone(timedelta(hours=9))
 PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
@@ -967,16 +967,15 @@ def parse_event_time(value):
 
 def party_max_members(data):
     max_members = data.get("max_members", PARTY_MAX_MEMBERS)
-    if max_members in {
-        PARTY_MAX_MEMBERS, INHOUSE_PARTY_MAX_MEMBERS, GAUNTLET_PARTY_MAX_MEMBERS
-    }:
+    # 지원 종료된 모집도 기존 정원은 보존하고, party_status에서 마감한다.
+    if isinstance(max_members, int) and max_members > 0:
         return max_members
     return PARTY_MAX_MEMBERS
 
 
 def party_type_name(max_members):
-    if max_members == GAUNTLET_PARTY_MAX_MEMBERS:
-        return "건틀릿 내전 (16명)"
+    if max_members not in SUPPORTED_PARTY_SIZES:
+        return "지원 종료 파티"
     return "내전 파티 (10명)" if max_members == INHOUSE_PARTY_MAX_MEMBERS else "5인 파티"
 
 
@@ -985,6 +984,8 @@ def party_preferred_tier_name(data):
 
 
 def party_status(data, now=None):
+    if party_max_members(data) not in SUPPORTED_PARTY_SIZES:
+        return "closed"
     now = now or utc_now()
     scheduled_at = as_utc(data.get("scheduled_at"))
     if scheduled_at is None or now >= scheduled_at:
@@ -1045,6 +1046,8 @@ async def build_party_embed(data, guild):
         "full": "🟡 정원 마감 · 대기 접수 중",
         "closed": "⚫ 모집 마감",
     }[status]
+    if max_members not in SUPPORTED_PARTY_SIZES:
+        status_text = "⚫ 지원 종료"
     color = {
         "open": discord.Color.green(),
         "full": discord.Color.gold(),
@@ -1067,7 +1070,8 @@ async def build_party_embed(data, guild):
             owner = " 👑" if user_id == creator_id else ""
             member_lines.append(f"{index + 1}. {member_names[user_id]}{owner}")
         else:
-            member_lines.append(f"{index + 1}. *모집 중*")
+            slot_text = "모집 마감" if status == "closed" else "모집 중"
+            member_lines.append(f"{index + 1}. *{slot_text}*")
 
     scheduled_at = as_utc(data["scheduled_at"])
     delete_at = as_utc(data.get("delete_at")) or scheduled_at + PARTY_DELETE_DELAY
@@ -1977,10 +1981,6 @@ class PartyTypeSelectionView(discord.ui.View):
     async def inhouse_party(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.select_type(interaction, INHOUSE_PARTY_MAX_MEMBERS)
 
-    @discord.ui.button(label="건틀릿 내전 (16명)", style=discord.ButtonStyle.success)
-    async def gauntlet_party(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.select_type(interaction, GAUNTLET_PARTY_MAX_MEMBERS)
-
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
@@ -1990,6 +1990,9 @@ class PartyTypeSelectionView(discord.ui.View):
 async def publish_party(
     interaction, channel, name, scheduled_at, max_members, preferred_tier="free"
 ):
+    if max_members not in SUPPORTED_PARTY_SIZES:
+        await interaction.followup.send("❌ 지원하지 않는 파티 유형이에요.", ephemeral=True)
+        return None
     creator_id = str(interaction.user.id)
 
     try:
@@ -2043,7 +2046,7 @@ async def publish_party(
         return None
 
 
-@bot.tree.command(name="파티생성", description="5인큐·일반 내전(10명)·건틀릿 내전(16명) 모집글을 생성합니다")
+@bot.tree.command(name="파티생성", description="5인큐·일반 내전(10명) 모집글을 생성합니다")
 @app_commands.describe(
     파티이름="파티 이름 (최대 30자)",
 )
@@ -3121,7 +3124,7 @@ async def cleanup_parties():
                     )
                 continue
 
-            if now >= scheduled_at and data.get("status") != "closed":
+            if party_status(data, now) == "closed" and data.get("status") != "closed":
                 data["status"] = "closed"
                 data["updated_at"] = now
                 updates = {"status": "closed", "updated_at": now}
