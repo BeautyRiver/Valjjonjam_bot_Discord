@@ -6,6 +6,9 @@
   2. 변경 코드를 GitHub main에 커밋·푸시합니다.
   3. 이 폴더의 Update-Bot.cmd를 더블클릭하고 대상 서버를 확인한 뒤 Y를 입력합니다.
      최초 SSH 접속 시 키 생성·서버 확인 안내가 나타날 수 있습니다.
+     이 도구는 사용자 폴더의 .ssh\valjjonjam_deploy 전용 키를 사용합니다.
+     기존 google_compute_engine 키는 그대로 두며, 전용 키도 덮어쓰지 않습니다.
+     전용 키가 불완전하다는 오류가 나면 파일을 지우거나 덮어쓰지 말고 확인하세요.
   4. active와 업데이트 완료 문구를 확인하고, Discord에서도 봇 동작을 확인합니다.
 
   - 대상: project-df59d642-8234-4a5d-859 / us-west1-a / valjjonjam-bot

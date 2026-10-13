@@ -31,6 +31,8 @@ try {
         throw 'PowerShell에서 gcloud auth login 으로 로그인한 다음 다시 실행해주세요.'
     }
     Write-Host "사용 계정: $activeAccount"
+    $sshKeyFile = Join-Path $env:USERPROFILE '.ssh\valjjonjam_deploy'
+    Write-Host '발쫀봇 전용 SSH 키를 사용합니다. 기존 Google Cloud 키는 덮어쓰지 않습니다.'
 
     # Keep this a single line without nested quotes for Windows native argument passing.
     # Stop on any error. Never overwrite server edits or create a merge commit.
@@ -49,7 +51,13 @@ try {
         'git log -1 --oneline'
     ) -join '; '
 
-    & $gcloud compute ssh $target "--project=$project" "--zone=$zone" "--command=$remoteCommand"
+    $sshArguments = @(
+        'compute', 'ssh', $target
+        "--project=$project", "--zone=$zone"
+        "--ssh-key-file=$sshKeyFile", '--no-force-key-file-overwrite'
+        "--command=$remoteCommand"
+    )
+    & $gcloud @sshArguments
     if ($LASTEXITCODE -ne 0) {
         throw '업데이트 또는 실행 확인에 실패했습니다. 일부 단계는 적용됐을 수 있으니 위 오류를 확인해주세요.'
     }
