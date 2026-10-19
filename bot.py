@@ -75,22 +75,22 @@ ROLES = ["타격대", "척후대", "전략가", "감시자", "플렉스"]
 # 내전·5인큐 기록으로 정리한 발쫀잼 내부 티어
 INTERNAL_TIER_LABELS = {
     "1": "1티어",
-    "2상": "2티어 -상", "2중": "2티어 -중", "2하": "2티어 -하",
-    "3상": "3티어 -상", "3중": "3티어 -중", "3하": "3티어 -하",
+    "2상": "2티어 -상", "2중": "2티어 -중", "2하": "2티어 -하", "2?": "2티어 -?",
+    "3상": "3티어 -상", "3중": "3티어 -중", "3하": "3티어 -하", "3?": "3티어 -?",
     "4상": "4티어 -상", "4중": "4티어 -중", "4하": "4티어 -하", "4?": "4티어 -?",
     "5상": "5티어 -상", "5중": "5티어 -중", "5하": "5티어 -하", "5?": "5티어 -?",
 }
 INTERNAL_TIER_SCORES = {
-    "1": 10,
-    "2상": 9, "2중": 8.5, "2하": 8,
-    "3상": 7, "3중": 6.5, "3하": 6,
-    "4상": 5, "4중": 4.5, "4하": 4, "4?": 4,
-    "5상": 3, "5중": 2.5, "5하": 2, "5?": 2,
+    "1": 17,
+    "2상": 15, "2중": 14, "2하": 13, "2?": 13,
+    "3상": 11, "3중": 10, "3하": 9, "3?": 9,
+    "4상": 7, "4중": 6, "4하": 5, "4?": 5,
+    "5상": 3, "5중": 2, "5하": 1, "5?": 1,
 }
 INTERNAL_TIER_CHOICES = [
     app_commands.Choice(name=label, value=tier)
     for tier, label in INTERNAL_TIER_LABELS.items()
-]
+] + [app_commands.Choice(name="미분류", value="unclassified")]
 
 # 인증(기본설정 완료) 역할명 — 이 역할이 있어야 일반 채널이 열리도록 서버 권한을 설정
 VERIFIED_ROLE = "인증됨"
@@ -575,7 +575,7 @@ async def cleanup_db_error(interaction: discord.Interaction, error):
 # ===== 발쫀잼 내부 티어 관리 =====
 
 @bot.tree.command(name="내부티어설정", description="(어드민) 멤버의 발쫀잼 내부 티어를 설정합니다")
-@app_commands.describe(대상="내부 티어를 설정할 멤버", 티어="설정할 발쫀잼 내부 티어")
+@app_commands.describe(대상="내부 티어를 설정할 멤버", 티어="설정할 발쫀잼 내부 티어 (미분류 선택 시 기존 티어 해제)")
 @app_commands.choices(티어=INTERNAL_TIER_CHOICES)
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -600,11 +600,18 @@ async def set_internal_tier(
         )
         return
 
+    internal_tier = None if 티어.value == "unclassified" else 티어.value
     await asyncio.to_thread(
         user_ref.set,
-        {"internal_tier": 티어.value, "updated_at": firestore.SERVER_TIMESTAMP},
+        {"internal_tier": internal_tier, "updated_at": firestore.SERVER_TIMESTAMP},
         merge=True,
     )
+    if internal_tier is None:
+        await interaction.followup.send(
+            f"✅ **{data['name']}** 님의 발쫀잼 내부 티어를 `미분류`로 설정했어요.",
+            ephemeral=True,
+        )
+        return
     await interaction.followup.send(
         f"✅ **{data['name']}** 님의 발쫀잼 내부 티어 `{INTERNAL_TIER_LABELS[티어.value]}` 설정을 완료했어요. "
         f"(밸런스 점수: `{INTERNAL_TIER_SCORES[티어.value]:g}점`)",
