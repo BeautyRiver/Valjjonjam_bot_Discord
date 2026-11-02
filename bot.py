@@ -109,6 +109,11 @@ PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
 EVENT_MAX_LEAD = timedelta(days=14)
 EVENT_PUBLIC_MEMBER_LIMIT = 20
+EVENT_TIER_MODES = {
+    "none": "제한 없음 (자유 참가)",
+    "valorant": "발로란트 티어",
+    "internal": "발쫀잼 내부 티어",
+}
 PARTY_PUBLIC_WAITLIST_LIMIT = 20
 PARTY_PREFERRED_TIER_LABELS = {
     "free": "자유 모집",
@@ -2118,6 +2123,96 @@ async def create_party(
 event_action_lock = asyncio.Lock()
 
 
+def event_tier_choices(mode):
+    if mode == "valorant":
+        return {tier: tier for tier in MAJOR_TIERS if tier != "언랭"}
+    if mode == "internal":
+        return {
+            tier: INTERNAL_TIER_LABELS[tier]
+            for tier in sorted(INTERNAL_TIER_SCORES, key=INTERNAL_TIER_SCORES.get)
+            if not tier.endswith("?")
+        }
+    return {}
+
+
+def event_tier_score(mode, tier):
+    if not isinstance(tier, str):
+        return None
+    if mode == "internal":
+        return INTERNAL_TIER_SCORES.get(tier)
+    if mode == "valorant":
+        normalized = "".join(tier.split())
+        valid_tiers = {"".join(value.split()) for value in TIERS + MAJOR_TIERS}
+        if normalized not in valid_tiers or normalized == "언랭":
+            return None
+        major = normalized.rstrip("123")
+        return MAJOR_TIERS.index(major)
+    return None
+
+
+def validate_event_tier_restriction(restriction):
+    # 기존 이벤트에는 이 필드가 없으므로 자유 참가로 유지합니다.
+    if restriction is None:
+        return None
+    if not isinstance(restriction, dict) or restriction.get("mode") not in EVENT_TIER_MODES:
+        return "❌ 참가 티어 조건이 올바르지 않아요. 운영진에게 문의해주세요."
+    mode = restriction["mode"]
+    if mode == "none":
+        return None
+    choices = event_tier_choices(mode)
+    minimum, maximum = restriction.get("min"), restriction.get("max")
+    if (
+        not isinstance(minimum, str) or minimum not in choices
+        or not isinstance(maximum, str) or maximum not in choices
+    ):
+        return "❌ 참가 가능한 최저·최고 티어를 모두 선택해주세요."
+    if event_tier_score(mode, minimum) > event_tier_score(mode, maximum):
+        return "❌ 최저 티어가 최고 티어보다 높아요. 참가 범위를 다시 선택해주세요."
+    return None
+
+
+def event_tier_restriction_text(restriction):
+    if validate_event_tier_restriction(restriction):
+        return "⚠️ 참가 티어 조건 설정 오류 · 운영진 확인 필요"
+    if restriction is None or restriction["mode"] == "none":
+        return EVENT_TIER_MODES["none"]
+    mode = restriction["mode"]
+    choices = event_tier_choices(mode)
+    text = f"{EVENT_TIER_MODES[mode]} **{choices[restriction['min']]} ~ {choices[restriction['max']]}**"
+    if mode == "valorant":
+        return text + "\n봇에 등록된 최대 티어 기준 · 세부 등급 1~3 모두 포함\n언랭·미등록은 티어 등록 후 참가할 수 있어요."
+    return text + "\n최저·최고 등급 포함 · ?는 해당 티어의 하와 동일하게 판정\n미분류·미등록은 내부 티어 등록 후 참가할 수 있어요."
+
+
+def event_tier_join_error(restriction, user_data):
+    if validate_event_tier_restriction(restriction):
+        return "❌ 이벤트의 참가 티어 조건이 올바르지 않아요. 운영진에게 문의해주세요."
+    if restriction is None or restriction["mode"] == "none":
+        return None
+    mode = restriction["mode"]
+    field = "internal_tier" if mode == "internal" else "tier"
+    tier = (user_data or {}).get(field)
+    score = event_tier_score(mode, tier)
+    if score is None:
+        if mode == "internal":
+            return (
+                "❌ 내부 티어가 미분류이거나 등록되지 않아 참가할 수 없어요.\n"
+                "운영진에게 `/내부티어설정`을 요청한 뒤 다시 참가해주세요."
+            )
+        return (
+            "❌ 발로란트 티어가 언랭이거나 등록되지 않아 참가할 수 없어요.\n"
+            "`/기본설정` 또는 `/역할설정`으로 최대 티어를 등록한 뒤 다시 참가해주세요."
+        )
+    if not event_tier_score(mode, restriction["min"]) <= score <= event_tier_score(mode, restriction["max"]):
+        tier_label = INTERNAL_TIER_LABELS[tier] if mode == "internal" else tier
+        return (
+            "❌ 이 이벤트의 참가 티어 범위에 해당하지 않아요.\n"
+            f"{event_tier_restriction_text(restriction)}\n"
+            f"내 등록 티어: **{escape_event_text(tier_label)}**"
+        )
+    return None
+
+
 def event_status(data, now=None):
     now = now or utc_now()
     scheduled_at = as_utc(data.get("scheduled_at"))
@@ -2156,6 +2251,7 @@ def build_toolkit_recruitment_data(kind, source_id, data, now=None):
             else []
         ),
         "preferred_tier": data.get("preferred_tier", "free") if kind == "party" else None,
+        "tier_restriction": data.get("tier_restriction") if kind == "event" else None,
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
     }
@@ -2244,6 +2340,11 @@ async def build_event_embed(data, guild):
     embed.add_field(name="현재 참가", value=f"**{member_count}명**", inline=True)
     embed.add_field(name="주최", value=member_names.get(creator_id, "알 수 없는 사용자"), inline=True)
     embed.add_field(
+        name="🎯 참가 티어 조건",
+        value=event_tier_restriction_text(data.get("tier_restriction")),
+        inline=False,
+    )
+    embed.add_field(
         name="경기 시작",
         value=f"<t:{scheduled_timestamp}:F>\n<t:{scheduled_timestamp}:R>",
         inline=False,
@@ -2307,15 +2408,27 @@ def list_events():
 def join_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
     snapshot = event_ref.get(transaction=transaction)
     if not snapshot.exists:
-        return "missing", None
+        return "missing", None, None
 
     data = snapshot.to_dict()
     if event_status(data, now) == "closed":
-        return "closed", data
+        return "closed", data, None
 
     member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
     if user_id in member_ids:
-        return "already", data
+        return "already", data, None
+
+    restriction = data.get("tier_restriction")
+    if validate_event_tier_restriction(restriction):
+        return "tier_restricted", data, event_tier_join_error(restriction, None)
+    if restriction is not None and restriction["mode"] != "none":
+        # 참가 조건과 멤버 티어를 같은 트랜잭션에서 읽어 검사한 뒤에만 저장합니다.
+        user_snapshot = db.collection("users").document(user_id).get(transaction=transaction)
+        error = event_tier_join_error(
+            restriction, user_snapshot.to_dict() if user_snapshot.exists else None
+        )
+        if error:
+            return "tier_restricted", data, error
 
     member_ids.append(user_id)
     data["member_ids"] = member_ids
@@ -2325,7 +2438,7 @@ def join_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
         mirror_ref,
         build_toolkit_recruitment_data("event", event_ref.id, data, now),
     )
-    return "joined", data
+    return "joined", data, None
 
 
 @transactional
@@ -2413,7 +2526,7 @@ class EventView(discord.ui.View):
                 event_ref = db.collection(EVENT_COLLECTION).document(event_id)
                 mirror_ref = get_toolkit_recruitment_ref("event", event_id)
                 transaction = db.transaction()
-                result, data = await asyncio.to_thread(
+                result, data, tier_error = await asyncio.to_thread(
                     join_event_transaction,
                     transaction,
                     event_ref,
@@ -2427,6 +2540,7 @@ class EventView(discord.ui.View):
                 "closed": "❌ 이미 모집이 마감된 이벤트예요.",
                 "already": "ℹ️ 이미 이벤트에 참가하고 있어요.",
                 "joined": "🏆 발쫀전 참가 신청을 완료했어요!",
+                "tier_restricted": tier_error,
             }
             refresh_warning = ""
             if result in {"joined", "closed"} and data is not None:
@@ -2615,6 +2729,18 @@ class EventView(discord.ui.View):
             await interaction.followup.send("❌ 이벤트 삭제 중 오류가 발생했어요.", ephemeral=True)
 
 
+class EventTierSelect(PartyCreationSelect):
+    async def callback(self, interaction: discord.Interaction):
+        setattr(self.parent_view, self.kind, self.values[0])
+        if self.kind == "tier_mode":
+            self.parent_view.tier_min = None
+            self.parent_view.tier_max = None
+        self.parent_view.refresh_tier_selects()
+        await interaction.response.edit_message(
+            content=self.parent_view.render_content(), view=self.parent_view
+        )
+
+
 class EventFeeSelectionView(discord.ui.View):
     def __init__(self, owner_id, name, channel):
         super().__init__(timeout=300)
@@ -2622,6 +2748,49 @@ class EventFeeSelectionView(discord.ui.View):
         self.name = name
         self.channel = channel
         self.started = False
+        self.tier_mode = "none"
+        self.tier_min = None
+        self.tier_max = None
+        self.refresh_tier_selects()
+
+    def tier_restriction(self):
+        return {"mode": self.tier_mode, "min": self.tier_min, "max": self.tier_max}
+
+    def refresh_tier_selects(self):
+        for item in list(self.children):
+            if isinstance(item, EventTierSelect):
+                self.remove_item(item)
+        self.add_item(EventTierSelect(
+            self, "tier_mode", "참가 제한 기준", [
+                discord.SelectOption(label=label, value=mode)
+                for mode, label in EVENT_TIER_MODES.items()
+            ], row=0,
+        ))
+        if self.tier_mode != "none":
+            for field, placeholder, row in (
+                ("tier_min", "최저 티어 (포함)", 1),
+                ("tier_max", "최고 티어 (포함)", 2),
+            ):
+                self.add_item(EventTierSelect(
+                    self, field, placeholder, [
+                        discord.SelectOption(label=label, value=tier)
+                        for tier, label in event_tier_choices(self.tier_mode).items()
+                    ], row=row,
+                ))
+
+    def render_content(self):
+        restriction = self.tier_restriction()
+        error = validate_event_tier_restriction(restriction)
+        condition = (
+            f"{EVENT_TIER_MODES[self.tier_mode]}\n{error}"
+            if error else event_tier_restriction_text(restriction)
+        )
+        return (
+            f"🏆 **발쫀전 · {escape_event_text(self.name)}** 생성\n"
+            f"🎯 참가 조건: {condition}\n\n"
+            "참가 조건을 확인한 뒤 아래에서 참가비 여부를 선택해주세요.\n"
+            "참가비가 있으면 입력한 은행·예금주·계좌번호가 모집글에 공개됩니다."
+        )
 
     async def interaction_check(self, interaction: discord.Interaction):
         if str(interaction.user.id) != self.owner_id:
@@ -2637,33 +2806,40 @@ class EventFeeSelectionView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="참가비 없음", style=discord.ButtonStyle.secondary)
+    async def open_details(self, interaction, has_entry_fee):
+        restriction = self.tier_restriction()
+        error = validate_event_tier_restriction(restriction)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        self.started = True
+        await interaction.response.send_modal(EventDetailsModal(
+            self.owner_id, self.name, self.channel, has_entry_fee,
+            tier_restriction=restriction,
+        ))
+
+    @discord.ui.button(label="참가비 없음", style=discord.ButtonStyle.secondary, row=3)
     async def no_entry_fee(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.started = True
-        await interaction.response.send_modal(
-            EventDetailsModal(self.owner_id, self.name, self.channel, has_entry_fee=False)
-        )
+        await self.open_details(interaction, has_entry_fee=False)
 
-    @discord.ui.button(label="참가비 있음", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="참가비 있음", style=discord.ButtonStyle.success, row=3)
     async def has_entry_fee(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.started = True
-        await interaction.response.send_modal(
-            EventDetailsModal(self.owner_id, self.name, self.channel, has_entry_fee=True)
-        )
+        await self.open_details(interaction, has_entry_fee=True)
 
-    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, row=3)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
         await interaction.response.edit_message(content="이벤트 생성을 취소했어요.", view=None)
 
 
 class EventDetailsModal(discord.ui.Modal):
-    def __init__(self, owner_id, name, channel, has_entry_fee):
+    def __init__(self, owner_id, name, channel, has_entry_fee, tier_restriction=None):
         super().__init__(title="발쫀전 상세 정보", timeout=300)
         self.owner_id = str(owner_id)
         self.name = name
         self.channel = channel
         self.has_entry_fee = has_entry_fee
+        self.tier_restriction = tier_restriction
 
         self.prize = discord.ui.TextInput(
             label="상품",
@@ -2713,6 +2889,7 @@ class EventDetailsModal(discord.ui.Modal):
             "bank_holder": self.bank_holder.value.strip() if self.bank_holder else None,
             "account_number": self.account_number.value.strip() if self.account_number else None,
             "rules": self.rules.value.strip(),
+            "tier_restriction": self.tier_restriction,
         }
         required_values = [details["prize"]]
         if self.has_entry_fee:
@@ -2790,6 +2967,7 @@ class EventCreationView(discord.ui.View):
             f"🏆 **발쫀전 · {escape_event_text(self.name)}** 생성\n"
             f"• 상품: **{escape_event_text(self.details['prize'])}**\n"
             f"• 참가비: **{fee_text}**\n"
+            f"• 참가 조건: {event_tier_restriction_text(self.details.get('tier_restriction'))}\n"
             f"• 날짜: **{date_text}**\n"
             f"• 시간: **{time_text}**\n\n"
             "날짜·시간을 선택한 뒤 `이벤트 생성`을 눌러주세요."
@@ -2801,6 +2979,10 @@ class EventCreationView(discord.ui.View):
             await interaction.response.send_message(
                 "ℹ️ 이벤트 모집글을 이미 생성하고 있어요.", ephemeral=True
             )
+            return
+        error = validate_event_tier_restriction(self.details.get("tier_restriction"))
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         if not all((self.selected_date, self.selected_hour, self.selected_minute)):
             await interaction.response.send_message(
@@ -2841,6 +3023,10 @@ class EventCreationView(discord.ui.View):
 
 
 async def publish_event(interaction, channel, name, scheduled_at, details):
+    error = validate_event_tier_restriction(details.get("tier_restriction"))
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return None
     creator_id = str(interaction.user.id)
     event_ref = None
     try:
@@ -2859,6 +3045,7 @@ async def publish_event(interaction, channel, name, scheduled_at, details):
                 "bank_holder": details["bank_holder"],
                 "account_number": details["account_number"],
                 "rules": details["rules"],
+                "tier_restriction": details.get("tier_restriction"),
                 "created_at": now,
                 "updated_at": now,
                 "status": "open",
@@ -2942,10 +3129,10 @@ async def create_event(
         )
         return
 
+    view = EventFeeSelectionView(interaction.user.id, name, channel)
     await interaction.followup.send(
-        f"🏆 **발쫀전 · {escape_event_text(name)}**의 참가비 여부를 선택해주세요.\n"
-        "참가비가 있으면 입력한 은행·예금주·계좌번호가 모집글에 공개됩니다.",
-        view=EventFeeSelectionView(interaction.user.id, name, channel),
+        view.render_content(),
+        view=view,
         ephemeral=True,
     )
 
