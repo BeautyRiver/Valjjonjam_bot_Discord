@@ -4,6 +4,7 @@ from discord import app_commands
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1 import transactional
+from google.cloud.firestore_v1.base_query import FieldFilter
 from dotenv import load_dotenv
 import os
 import asyncio
@@ -108,6 +109,7 @@ PARTY_MIN_LEAD = timedelta(minutes=10)
 PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
 EVENT_MAX_LEAD = timedelta(days=14)
+EVENT_REFRESH_WINDOW = timedelta(days=1)
 EVENT_PUBLIC_MEMBER_LIMIT = 20
 EVENT_TEAM_SIZE = 5
 # 홀수 팀이 생기지 않도록 2팀(10명) 단위로만 참가 확정
@@ -306,6 +308,82 @@ class TierRoleView(discord.ui.View):
             for opt in self.division_select.options:
                 opt.default = False
 
+ROLE_FAILED_NOTICE = "\n⚠️ 일부 역할을 적용하지 못했어요. (봇에 '역할 관리' 권한을 주고 봇 역할을 위로 올려주세요)"
+NICKNAME_FORBIDDEN_NOTICE = (
+    "\n⚠️ 닉네임을 바꿀 권한이 없어요. (서버 주인 닉네임은 봇이 못 바꿔요 / "
+    "그 외엔 '별명 관리하기' 권한 + 봇 역할을 위로 올려주세요)"
+)
+NICKNAME_FAILED_NOTICE = (
+    "\n⚠️ 닉네임은 바꾸지 못했어요. (이름·발로 닉네임에 `@`, `discord`, `clyde`, `everyone`, `here` "
+    "같은 단어가 들어가면 디스코드가 막아요. `/닉네임변경` 으로 다시 시도해보세요)"
+)
+DB_SAVE_FAILED_NOTICE = (
+    "\n⚠️ 입력한 정보를 DB에 저장하지 못했어요. 잠시 후 다시 시도해주세요. "
+    "(저장 전까지 이벤트 참가 조건과 웹에는 이전 정보가 적용돼요)"
+)
+
+
+# 티어·역할군 역할 교체 — add/remove로 처리해 봇보다 위 역할을 가진 멤버에게도 영향을 덜 받음
+# 성공하면 None, 실패하면 Discord 예외를 반환
+async def apply_tier_roles(guild, member, tier, selected_roles, extra_roles=()):
+    to_add = []
+    for role_name in [tier, *selected_roles]:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            to_add.append(role)
+    to_add.extend(extra_roles)
+
+    managed = set(TIERS + ROLES)
+    to_remove = [r for r in member.roles if r.name in managed and r not in to_add]
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove)
+        await member.add_roles(*to_add)
+    except discord.HTTPException as e:
+        log.error(
+            "역할 적용 실패 — %s(%s) / 부여시도=%s / status=%s code=%s: %s",
+            member, member.id, [r.name for r in to_add],
+            getattr(e, "status", "?"), getattr(e, "code", "?"), e,
+        )
+        return e
+    return None
+
+
+# 닉네임 변경 — 성공하면 "", 실패하면 사용자 안내 문구를 반환
+async def apply_nickname(member, nickname):
+    try:
+        await member.edit(nick=nickname)
+        return ""
+    except discord.HTTPException as e:
+        log.error(
+            "닉네임 변경 실패 — %s(%s) / 닉='%s' / status=%s code=%s: %s",
+            member, member.id, nickname,
+            getattr(e, "status", "?"), getattr(e, "code", "?"), e,
+        )
+        if isinstance(e, discord.Forbidden):
+            return NICKNAME_FORBIDDEN_NOTICE
+        return NICKNAME_FAILED_NOTICE
+
+
+# users 문서에 병합 저장 (다른 필드는 유지) — 실패하면 로그를 남기고 False
+async def save_user_profile(member, fields):
+    try:
+        await asyncio.to_thread(
+            db.collection("users").document(str(member.id)).set,
+            {
+                "discord_id": str(member.id),
+                "username": member.name,
+                **fields,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return True
+    except Exception:
+        log.exception("멤버 정보 DB 저장 실패 — %s(%s)", member, member.id)
+        return False
+
+
 # 확인 버튼
 class ConfirmButton(discord.ui.Button):
     def __init__(self):
@@ -322,41 +400,20 @@ class ConfirmButton(discord.ui.Button):
             return
 
         await interaction.response.send_message("⏳ 적용 중...", ephemeral=True)
-        guild = interaction.guild
         member = view.target or interaction.user  # 관리자가 대신 설정 시 대상 멤버
 
-        # 새로 부여할 티어/역할군 역할
-        managed = set(TIERS + ROLES)
-        to_add = []
-        tier_role = discord.utils.get(guild.roles, name=tier)
-        if tier_role:
-            to_add.append(tier_role)
-        for role_name in view.selected_roles:
-            role_role = discord.utils.get(guild.roles, name=role_name)
-            if role_role:
-                to_add.append(role_role)
-
-        # 기존 티어/역할군은 빼고 나머지는 유지 + 새 역할 → 한 번의 호출로 적용
-        keep = [r for r in member.roles if r.name not in managed and not r.is_default()]
-        await member.edit(roles=keep + to_add)
-
-        await interaction.edit_original_response(
-            content=f"✅ **{member.display_name}** 님\n티어: `{tier}` | 역할군: `{', '.join(view.selected_roles)}` 설정 완료!"
+        role_failed = await apply_tier_roles(interaction.guild, member, tier, view.selected_roles)
+        saved = await save_user_profile(
+            member,
+            {"nickname": member.display_name, "tier": tier, "role": view.selected_roles},
         )
 
-        # Firestore 저장은 응답 후 백그라운드에서 (이벤트 루프 차단 방지)
-        await asyncio.to_thread(
-            db.collection("users").document(str(member.id)).set,
-            {
-                "discord_id": str(member.id),
-                "username": member.name,
-                "nickname": member.display_name,
-                "tier": tier,
-                "role": view.selected_roles,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            },
-            merge=True
-        )
+        msg = f"✅ **{member.display_name}** 님\n티어: `{tier}` | 역할군: `{', '.join(view.selected_roles)}` 설정 완료!"
+        if role_failed:
+            msg += ROLE_FAILED_NOTICE
+        if not saved:
+            msg += DB_SAVE_FAILED_NOTICE
+        await interaction.edit_original_response(content=msg)
 
 # 전체 View
 class RoleSelectView(TierRoleView):
@@ -717,50 +774,28 @@ class BasicSetupConfirmButton(discord.ui.Button):
         guild = interaction.guild
         member = view.target or interaction.user  # 관리자가 대신 설정 시 대상 멤버
 
-        # 새로 부여할 티어/역할군 역할
-        managed = set(TIERS + ROLES)
-        to_add = []
-        tier_role = discord.utils.get(guild.roles, name=tier)
-        if tier_role:
-            to_add.append(tier_role)
-        for role_name in view.selected_roles:
-            role_role = discord.utils.get(guild.roles, name=role_name)
-            if role_role:
-                to_add.append(role_role)
-
-        # 기본설정 완료 → 인증 역할도 함께 부여 (없으면 생성)
+        # ① 기본설정 완료 → 인증 역할도 함께 부여 (없으면 생성)
+        #    역할을 먼저·따로 부여 — 닉네임이 막혀도 인증은 무조건 되게
         verified = await get_or_create_verified_role(guild)
-        to_add.append(verified)
+        role_failed = await apply_tier_roles(
+            guild, member, tier, view.selected_roles, extra_roles=[verified]
+        )
 
-        # ① 역할(인증)을 먼저·따로 부여 — 닉네임이 막혀도 인증은 무조건 되게
-        #    add/remove로 처리하면 봇보다 위 역할을 가진 멤버에게도 영향을 덜 받음
-        managed_all = managed | {VERIFIED_ROLE}
-        to_remove = [r for r in member.roles if r.name in managed_all and r not in to_add]
-        role_failed = None
-        try:
-            if to_remove:
-                await member.remove_roles(*to_remove)
-            await member.add_roles(*to_add)
-        except discord.HTTPException as e:
-            role_failed = e
-            log.error(
-                "역할 적용 실패 — %s(%s) / 부여시도=%s / status=%s code=%s: %s",
-                member, member.id, [r.name for r in to_add],
-                getattr(e, "status", "?"), getattr(e, "code", "?"), e,
-            )
+        # ② 닉네임은 별도로 — 실패해도 인증은 통과
+        nick_notice = await apply_nickname(
+            member, build_nickname(view.student_id, view.name, view.riot_id)
+        )
 
-        # ② 닉네임은 별도로 — 실패해도 인증은 통과 (Forbidden/HTTPException 모두 처리)
-        new_nick = build_nickname(view.student_id, view.name, view.riot_id)
-        nick_failed = None
-        try:
-            await member.edit(nick=new_nick)
-        except discord.HTTPException as e:
-            nick_failed = e
-            log.error(
-                "닉네임 변경 실패 — %s(%s) / 닉='%s' / status=%s code=%s: %s",
-                member, member.id, new_nick,
-                getattr(e, "status", "?"), getattr(e, "code", "?"), e,
-            )
+        saved = await save_user_profile(
+            member,
+            {
+                "student_id": view.student_id,
+                "name": view.name,
+                "riot_id": view.riot_id,
+                "tier": tier,
+                "role": view.selected_roles,
+            },
+        )
 
         msg = (
             f"✅ **{view.name}** 님 설정 완료!\n"
@@ -768,26 +803,11 @@ class BasicSetupConfirmButton(discord.ui.Button):
             f"티어: `{tier}` | 역할군: `{', '.join(view.selected_roles)}`"
         )
         if role_failed:
-            msg += "\n⚠️ 일부 역할을 적용하지 못했어요. (봇에 '역할 관리' 권한을 주고 봇 역할을 위로 올려주세요)"
-        if nick_failed:
-            msg += "\n⚠️ 닉네임은 바꾸지 못했어요. (이름·발로 닉네임에 `@`, `discord`, `clyde`, `everyone`, `here` 같은 단어가 들어가면 디스코드가 막아요. `/닉네임변경` 으로 다시 시도해보세요)"
+            msg += ROLE_FAILED_NOTICE
+        msg += nick_notice
+        if not saved:
+            msg += DB_SAVE_FAILED_NOTICE
         await interaction.edit_original_response(content=msg)
-
-        # Firestore 저장은 응답 후 백그라운드에서 (이벤트 루프 차단 방지)
-        await asyncio.to_thread(
-            db.collection("users").document(str(member.id)).set,
-            {
-                "discord_id": str(member.id),
-                "username": member.name,
-                "student_id": view.student_id,
-                "name": view.name,
-                "riot_id": view.riot_id,
-                "tier": tier,
-                "role": view.selected_roles,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            },
-            merge=True
-        )
 
 # 2단계 View (모달 입력값을 들고 다님)
 class BasicSetupView(TierRoleView):
@@ -829,33 +849,20 @@ class NicknameModal(discord.ui.Modal):
         member = self.target  # 관리자가 대신 변경 시 대상 멤버
         sid, nm, rid = str(self.student_id), str(self.name), str(self.riot_id)
         new_nick = build_nickname(sid, nm, rid)
-
-        nick_failed = False
-        try:
-            await member.edit(nick=new_nick)
-        except discord.Forbidden:
-            nick_failed = True
+        nick_notice = await apply_nickname(member, new_nick)
 
         # 입력한 정보도 DB에 반영 (기존 티어/역할군 등은 유지)
-        await asyncio.to_thread(
-            db.collection("users").document(str(member.id)).set,
-            {
-                "discord_id": str(member.id),
-                "username": member.name,
-                "student_id": sid,
-                "name": nm,
-                "riot_id": rid,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            },
-            merge=True
-        )
+        saved = await save_user_profile(member, {"student_id": sid, "name": nm, "riot_id": rid})
 
-        if nick_failed:
-            await interaction.edit_original_response(
-                content="⚠️ 닉네임을 바꿀 권한이 없어요. (서버 주인 닉네임은 봇이 못 바꿔요 / 그 외엔 '별명 관리하기' 권한 + 봇 역할을 위로 올려주세요)\n정보는 저장했어요."
-            )
+        if not nick_notice:
+            msg = f"✅ 닉네임을 `{new_nick}` (으)로 변경했어요!"
         else:
-            await interaction.edit_original_response(content=f"✅ 닉네임을 `{new_nick}` (으)로 변경했어요!")
+            msg = nick_notice.lstrip("\n")
+            if saved:
+                msg += "\n정보는 저장했어요."
+        if not saved:
+            msg += DB_SAVE_FAILED_NOTICE
+        await interaction.edit_original_response(content=msg)
 
 @bot.tree.command(name="닉네임변경", description="디스코드 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
 async def change_nickname(interaction: discord.Interaction):
@@ -1845,7 +1852,7 @@ class PartyTimeEditView(discord.ui.View):
             f"• 현재: <t:{self.current_timestamp}:F>\n"
             f"• 변경: **{date_text} {self.selected_hour}:{self.selected_minute}**\n\n"
             "날짜·시간을 확인한 뒤 `시간 변경`을 눌러주세요. "
-            "자동 삭제 시각도 새 시작 시간의 10시간 후로 바뀌니다."
+            "자동 삭제 시각도 새 시작 시간의 10시간 후로 바뀝니다."
         )
 
     @discord.ui.button(label="시간 변경", style=discord.ButtonStyle.success, row=3)
@@ -2428,8 +2435,18 @@ def get_event_data(event_id):
     return snapshot.to_dict() if snapshot.exists else None
 
 
-def list_events():
-    return [(doc.id, doc.to_dict()) for doc in db.collection(EVENT_COLLECTION).stream()]
+# 이벤트는 자동 삭제되지 않아 문서가 계속 쌓이므로, 전체가 아닌 필요한 범위만 조회
+def list_open_events():
+    query = db.collection(EVENT_COLLECTION).where(filter=FieldFilter("status", "==", "open"))
+    return [(doc.id, doc.to_dict()) for doc in query.stream()]
+
+
+# 재시작 시 갱신 대상: 아직 시작 전(수동 마감 포함)이거나 최근에 시작한 이벤트
+def list_recent_events(now):
+    query = db.collection(EVENT_COLLECTION).where(
+        filter=FieldFilter("scheduled_at", ">=", now - EVENT_REFRESH_WINDOW)
+    )
+    return [(doc.id, doc.to_dict()) for doc in query.stream()]
 
 
 @transactional
@@ -3305,7 +3322,7 @@ async def get_event_message(data):
 
 async def refresh_event_messages():
     try:
-        events = await asyncio.to_thread(list_events)
+        events = await asyncio.to_thread(list_recent_events, utc_now())
     except Exception:
         log.exception("기존 이벤트 모집글 목록 조회 실패")
         return
@@ -3386,7 +3403,7 @@ async def cleanup_parties():
 @tasks.loop(minutes=1)
 async def close_started_events():
     try:
-        events = await asyncio.to_thread(list_events)
+        events = await asyncio.to_thread(list_open_events)
     except Exception:
         log.exception("이벤트 자동 마감 목록 조회 실패")
         return

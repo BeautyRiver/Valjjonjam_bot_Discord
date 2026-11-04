@@ -19,12 +19,20 @@ import discord
 
 
 CONSTANTS = {
-    "TIERS", "MAJOR_TIERS", "INTERNAL_TIER_LABELS", "INTERNAL_TIER_SCORES",
+    "TIERS", "MAJOR_TIERS", "NO_DIVISION", "ROLES", "VERIFIED_ROLE",
+    "INTERNAL_TIER_LABELS", "INTERNAL_TIER_SCORES",
     "EVENT_TIER_MODES", "EVENT_PUBLIC_MEMBER_LIMIT", "EVENT_TEAM_SIZE",
-    "EVENT_CONFIRM_UNIT", "PARTY_TIMEZONE",
+    "EVENT_CONFIRM_UNIT", "EVENT_REFRESH_WINDOW", "PARTY_TIMEZONE",
     "EVENT_COLLECTION", "TOOLKIT_RECRUITMENT_COLLECTION",
+    "ROLE_FAILED_NOTICE", "NICKNAME_FORBIDDEN_NOTICE", "NICKNAME_FAILED_NOTICE",
+    "DB_SAVE_FAILED_NOTICE",
 }
 DEFINITIONS = {
+    "make_tier", "resolve_tier", "build_nickname", "get_or_create_verified_role",
+    "apply_tier_roles", "apply_nickname", "save_user_profile",
+    "MajorTierSelect", "DivisionSelect", "RoleSelect", "TierRoleView",
+    "ConfirmButton", "RoleSelectView", "BasicSetupConfirmButton", "BasicSetupView",
+    "NicknameModal", "list_open_events", "list_recent_events",
     "utc_now", "as_utc", "event_tier_choices", "event_tier_score",
     "validate_event_tier_restriction", "event_tier_restriction_text",
     "event_tier_join_error", "event_status", "escape_event_text",
@@ -51,6 +59,7 @@ for node in tree.body:
 ns = {
     "discord": discord, "asyncio": asyncio, "datetime": datetime,
     "timedelta": timedelta, "timezone": timezone, "log": logging.getLogger(__name__),
+    "firestore": SimpleNamespace(SERVER_TIMESTAMP="SERVER_TIMESTAMP"),
 }
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source_path), "exec"), ns)
 
@@ -436,6 +445,115 @@ class EventUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("대기 3명", fields["팀 구성 현황"])
         self.assertIn("참가 확정 명단에 있는 분만", fields["💳 참가비"])
         self.assertFalse(any("권장" in name for name in fields))
+
+
+def http_error(cls=discord.HTTPException, status=400):
+    return cls(SimpleNamespace(status=status, reason="test"), "test error")
+
+
+class FakeUsersDatabase:
+    def __init__(self, fail=False):
+        self.saved = {}
+        self.fail = fail
+
+    def collection(self, name):
+        def document(doc_id):
+            def set_document(data, merge=False):
+                if self.fail:
+                    raise RuntimeError("Firestore unavailable")
+                self.saved[f"{name}/{doc_id}"] = data
+            return SimpleNamespace(set=set_document)
+        return SimpleNamespace(document=document)
+
+
+class MemberProfileTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.roles = {name: SimpleNamespace(name=name) for name in ("실버 1", "골드 2", "타격대", "인증됨")}
+        self.member = SimpleNamespace(
+            id=42, name="tester", display_name="테스터", roles=[self.roles["실버 1"]],
+            add_roles=AsyncMock(), remove_roles=AsyncMock(), edit=AsyncMock(),
+        )
+        self.db = FakeUsersDatabase()
+        self.log = Mock()
+        self.patch = patch.dict(ns, {"db": self.db, "log": self.log})
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def call(self):
+        call = interaction()
+        call.guild = SimpleNamespace(id=100, roles=list(self.roles.values()))
+        return call
+
+    def content(self, call):
+        return call.edit_original_response.call_args.kwargs["content"]
+
+    async def confirm(self, view):
+        view.major_tier, view.division, view.selected_roles = "골드", "2", ["타격대"]
+        button = next(child for child in view.children if isinstance(child, discord.ui.Button))
+        call = self.call()
+        await button.callback(call)
+        return call
+
+    async def submit_nickname(self):
+        modal = ns["NicknameModal"](self.member, "21", "홍길동", "test#kr1")
+        for item, value in ((modal.student_id, "21"), (modal.name, "홍길동"), (modal.riot_id, "test#kr1")):
+            item._value = value
+        call = self.call()
+        await modal.on_submit(call)
+        return call
+
+    async def test_nickname_rejected_by_discord_still_saves_and_explains(self):
+        self.member.edit.side_effect = http_error()
+        content = self.content(await self.submit_nickname())
+        self.assertIn("`discord`", content)
+        self.assertIn("정보는 저장했어요", content)
+        self.assertEqual(self.db.saved["users/42"]["name"], "홍길동")
+
+    async def test_nickname_without_permission_and_success_messages(self):
+        self.member.edit.side_effect = http_error(discord.Forbidden, 403)
+        self.assertIn("권한이 없어요", self.content(await self.submit_nickname()))
+        self.member.edit.side_effect = None
+        self.assertIn("변경했어요", self.content(await self.submit_nickname()))
+
+    async def test_role_setup_failure_is_reported_and_profile_is_saved(self):
+        self.member.remove_roles.side_effect = http_error(discord.Forbidden, 403)
+        call = await self.confirm(ns["RoleSelectView"](self.member))
+        self.assertIn("일부 역할을 적용하지 못했어요", self.content(call))
+        self.member.remove_roles.assert_awaited_once_with(self.roles["실버 1"])
+        self.assertEqual(self.db.saved["users/42"]["tier"], "골드 2")
+        self.assertEqual(self.db.saved["users/42"]["role"], ["타격대"])
+
+    async def test_db_failure_is_shown_instead_of_silent_success(self):
+        self.db.fail = True
+        content = self.content(await self.confirm(ns["RoleSelectView"](self.member)))
+        self.assertIn("설정 완료", content)
+        self.assertIn("DB에 저장하지 못했어요", content)
+        self.log.exception.assert_called_once()
+        self.member.add_roles.assert_awaited_once_with(self.roles["골드 2"], self.roles["타격대"])
+
+    async def test_basic_setup_grants_verified_role_even_if_nickname_fails(self):
+        self.member.edit.side_effect = http_error()
+        view = ns["BasicSetupView"]("21", "홍길동", "test#kr1", self.member)
+        content = self.content(await self.confirm(view))
+        self.member.add_roles.assert_awaited_once_with(
+            self.roles["골드 2"], self.roles["타격대"], self.roles["인증됨"]
+        )
+        self.assertIn("닉네임은 바꾸지 못했어요", content)
+        self.assertEqual(self.db.saved["users/42"]["riot_id"], "test#kr1")
+
+
+class EventQueryTests(unittest.TestCase):
+    def test_event_loops_read_only_open_or_recent_events(self):
+        db = Mock()
+        where = db.collection.return_value.where
+        where.return_value.stream.return_value = [SimpleNamespace(id="1", to_dict=lambda: {"status": "open"})]
+        now = datetime(2026, 11, 5, tzinfo=timezone.utc)
+        with patch.dict(ns, {"db": db, "FieldFilter": lambda *args: args}):
+            self.assertEqual(ns["list_open_events"](), [("1", {"status": "open"})])
+            where.assert_called_with(filter=("status", "==", "open"))
+            ns["list_recent_events"](now)
+            where.assert_called_with(filter=("scheduled_at", ">=", now - timedelta(days=1)))
+        db.collection.assert_called_with("events")
 
 
 if __name__ == "__main__":
