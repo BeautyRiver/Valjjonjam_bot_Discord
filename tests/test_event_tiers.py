@@ -20,7 +20,8 @@ import discord
 
 CONSTANTS = {
     "TIERS", "MAJOR_TIERS", "INTERNAL_TIER_LABELS", "INTERNAL_TIER_SCORES",
-    "EVENT_TIER_MODES", "EVENT_PUBLIC_MEMBER_LIMIT", "PARTY_TIMEZONE",
+    "EVENT_TIER_MODES", "EVENT_PUBLIC_MEMBER_LIMIT", "EVENT_TEAM_SIZE",
+    "EVENT_CONFIRM_UNIT", "PARTY_TIMEZONE",
     "EVENT_COLLECTION", "TOOLKIT_RECRUITMENT_COLLECTION",
 }
 DEFINITIONS = {
@@ -30,7 +31,8 @@ DEFINITIONS = {
     "build_toolkit_recruitment_data", "get_toolkit_recruitment_ref",
     "set_recruitment_pair", "delete_recruitment_pair", "join_event_transaction",
     "leave_event_transaction", "set_event_registration_transaction",
-    "event_team_progress", "event_format_recommendation", "build_event_embed",
+    "split_event_members", "event_member_state_text", "event_member_lines",
+    "event_team_progress", "build_event_embed",
     "make_event_date_options", "make_party_hour_options", "make_party_minute_options",
     "PartyCreationSelect", "EventTierSelect", "EventFeeSelectionView",
     "EventDetailsModal", "EventCreationView", "EventView", "publish_event",
@@ -187,6 +189,42 @@ class TierRuleTests(unittest.TestCase):
         self.assertEqual(ns["event_tier_score"]("valorant", "초월자1"), ns["event_tier_score"]("valorant", "초월자 1"))
 
 
+class EventEvenTeamTests(unittest.TestCase):
+    def test_members_are_confirmed_only_in_units_of_two_teams(self):
+        for count, confirmed in ((0, 0), (7, 0), (10, 10), (13, 10), (15, 10), (19, 10), (20, 20), (25, 20)):
+            member_ids = [str(index) for index in range(count)]
+            with self.subTest(count=count):
+                confirmed_ids, waitlist_ids = ns["split_event_members"](member_ids)
+                self.assertEqual(confirmed_ids, member_ids[:confirmed])
+                self.assertEqual(waitlist_ids, member_ids[confirmed:])
+                self.assertEqual(len(confirmed_ids) // 5 % 2, 0)  # 홀수 팀이 확정되지 않음
+
+    def test_team_progress_and_member_state_text(self):
+        self.assertEqual(ns["event_team_progress"](7), "확정된 팀 없음 · 2팀 확정까지 3명 남음")
+        self.assertEqual(ns["event_team_progress"](10), "2팀 확정 (10명) · 4팀까지 10명 남음")
+        self.assertEqual(ns["event_team_progress"](13), "2팀 확정 (10명) · 대기 3명 · 4팀까지 7명 남음")
+        member_ids = [str(index) for index in range(13)]
+        self.assertIn("참가 확정", ns["event_member_state_text"](member_ids, "9"))
+        self.assertIn("대기 2번", ns["event_member_state_text"](member_ids, "11"))
+
+    def test_cancellation_moves_next_waiting_member_into_confirmed(self):
+        member_ids = [str(index) for index in range(13)]
+        member_ids.remove("3")
+        confirmed_ids, waitlist_ids = ns["split_event_members"](member_ids)
+        self.assertEqual(confirmed_ids[-1], "10")
+        self.assertEqual(waitlist_ids, ["11", "12"])
+
+    def test_mirror_splits_events_but_keeps_party_waitlist(self):
+        event = event_data()
+        event["member_ids"] = [str(index) for index in range(13)]
+        mirror = ns["build_toolkit_recruitment_data"]("event", "99", event)
+        self.assertEqual(mirror["member_ids"], event["member_ids"][:10])
+        self.assertEqual(mirror["waitlist_ids"], ["10", "11", "12"])
+        self.assertIsNone(mirror["max_members"])
+        for field in ("prize", "rules", "entry_fee", "bank_holder", "account_number"):
+            self.assertNotIn(field, mirror)
+
+
 class EventTransactionTests(unittest.TestCase):
     def setUp(self):
         self.db = FakeDatabase()
@@ -210,7 +248,9 @@ class EventTransactionTests(unittest.TestCase):
         self.assertEqual(self.db.last_transaction.reads, ["events/99", "users/42"])
         self.assertEqual(data["member_ids"], ["42"])
         mirror = self.db.documents["toolkit_recruitments/event_99"]
-        self.assertEqual(mirror["member_ids"], ["42"])
+        # 10명 미만이면 원본에는 신청 순서로 남고, 미러에서는 대기로 전달됩니다.
+        self.assertEqual(mirror["member_ids"], [])
+        self.assertEqual(mirror["waitlist_ids"], ["42"])
         self.assertEqual(mirror["tier_restriction"], restriction())
         self.assertNotIn("account_number", mirror)
 
@@ -381,6 +421,21 @@ class EventUITests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(expected, call.followup.send.call_args.args[0])
             self.assertTrue(call.followup.send.call_args.kwargs["ephemeral"])
             self.assertEqual(self.db.documents["events/99"]["member_ids"], ["42"] if tier == "5?" else [])
+        self.assertIn("대기 1번", call.followup.send.call_args.args[0])
+
+    async def test_embed_splits_confirmed_and_waitlist_without_format_advice(self):
+        data = event_data()
+        data.update(member_ids=[str(index) for index in range(10, 23)], has_entry_fee=True)
+        names = AsyncMock(side_effect=lambda guild, ids: {member_id: f"멤버{member_id}" for member_id in ids})
+        with patch.dict(ns, {"get_party_member_names": names}):
+            embed = await ns["build_event_embed"](data, None)
+        fields = {field.name: field.value for field in embed.fields}
+        self.assertIn("1. 멤버10", fields["✅ 참가 확정 (10명)"])
+        self.assertNotIn("멤버20", fields["✅ 참가 확정 (10명)"])
+        self.assertEqual(fields["⏳ 대기 (3명)"], "1. 멤버20\n2. 멤버21\n3. 멤버22")
+        self.assertIn("대기 3명", fields["팀 구성 현황"])
+        self.assertIn("참가 확정 명단에 있는 분만", fields["💳 참가비"])
+        self.assertFalse(any("권장" in name for name in fields))
 
 
 if __name__ == "__main__":

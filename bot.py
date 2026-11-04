@@ -109,6 +109,9 @@ PARTY_MAX_LEAD = timedelta(hours=24)
 PARTY_DELETE_DELAY = timedelta(hours=10)
 EVENT_MAX_LEAD = timedelta(days=14)
 EVENT_PUBLIC_MEMBER_LIMIT = 20
+EVENT_TEAM_SIZE = 5
+# 홀수 팀이 생기지 않도록 2팀(10명) 단위로만 참가 확정
+EVENT_CONFIRM_UNIT = EVENT_TEAM_SIZE * 2
 EVENT_TIER_MODES = {
     "none": "제한 없음 (자유 참가)",
     "valorant": "발로란트 티어",
@@ -2227,12 +2230,16 @@ def get_toolkit_recruitment_ref(kind, source_id):
 
 
 def build_toolkit_recruitment_data(kind, source_id, data, now=None):
+    member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
     if kind == "party":
         status = party_status(data, now)
         max_members = party_max_members(data)
+        waitlist_ids = [str(member_id) for member_id in data.get("waitlist_ids", [])]
     elif kind == "event":
         status = event_status(data, now)
         max_members = None
+        # 이벤트는 원본에 신청 순서만 저장하고, 미러에는 확정·대기로 나눠 웹 팀 편성에 전달
+        member_ids, waitlist_ids = split_event_members(member_ids)
     else:
         raise ValueError(f"지원하지 않는 모집 유형입니다: {kind}")
 
@@ -2244,12 +2251,8 @@ def build_toolkit_recruitment_data(kind, source_id, data, now=None):
         "scheduled_at": as_utc(data.get("scheduled_at")),
         "status": status,
         "max_members": max_members,
-        "member_ids": [str(member_id) for member_id in data.get("member_ids", [])],
-        "waitlist_ids": (
-            [str(member_id) for member_id in data.get("waitlist_ids", [])]
-            if kind == "party"
-            else []
-        ),
+        "member_ids": member_ids,
+        "waitlist_ids": waitlist_ids,
         "preferred_tier": data.get("preferred_tier", "free") if kind == "party" else None,
         "tier_restriction": data.get("tier_restriction") if kind == "event" else None,
         "created_at": data.get("created_at"),
@@ -2284,29 +2287,50 @@ def delete_recruitment_pair(source_ref, kind, source_id):
     batch.commit()
 
 
-def event_team_progress(member_count):
-    team_count, reserve_count = divmod(member_count, 5)
-    if team_count == 0:
-        return f"완성된 팀 없음 · 1팀까지 {5 - reserve_count}명 남음"
+def split_event_members(member_ids):
+    """신청 순서대로 10명 단위까지 참가 확정, 나머지는 대기로 나눔 (DB에는 전체 순서만 저장)."""
+    confirmed_count = len(member_ids) // EVENT_CONFIRM_UNIT * EVENT_CONFIRM_UNIT
+    return member_ids[:confirmed_count], member_ids[confirmed_count:]
 
-    text = f"{team_count}팀 확정"
-    if reserve_count:
-        text += f" + 대기 {reserve_count}명"
-    text += f" · {team_count + 1}팀까지 {5 - reserve_count}명 남음"
+
+def event_member_state_text(member_ids, user_id):
+    confirmed_ids, waitlist_ids = split_event_members(member_ids)
+    if user_id in confirmed_ids:
+        return "현재 **참가 확정**이에요."
+    if user_id in waitlist_ids:
+        return (
+            f"현재 **대기 {waitlist_ids.index(user_id) + 1}번**이에요. "
+            f"{EVENT_CONFIRM_UNIT}명 단위로 인원이 차면 참가가 확정돼요."
+        )
+    return ""
+
+
+def event_team_progress(member_count):
+    confirmed_count = member_count // EVENT_CONFIRM_UNIT * EVENT_CONFIRM_UNIT
+    waiting_count = member_count - confirmed_count
+    needed = EVENT_CONFIRM_UNIT - waiting_count
+    team_count = confirmed_count // EVENT_TEAM_SIZE
+    if team_count == 0:
+        return f"확정된 팀 없음 · 2팀 확정까지 {needed}명 남음"
+
+    text = f"{team_count}팀 확정 ({confirmed_count}명)"
+    if waiting_count:
+        text += f" · 대기 {waiting_count}명"
+    text += f" · {team_count + 2}팀까지 {needed}명 남음"
     return text
 
 
-def event_format_recommendation(member_count):
-    team_count = member_count // 5
-    if team_count < 2:
-        return "2팀 구성을 위해 참가자를 모집 중입니다."
-    if team_count == 2:
-        return "2팀 단판 또는 다전제 경기 권장"
-    if team_count == 3:
-        return "3팀 풀리그 후 상위 2팀 결승 권장"
-    if team_count == 4:
-        return "4강 토너먼트 후 결승 권장"
-    return f"{team_count}팀 예선 후 토너먼트 또는 부전승 방식 권장"
+def event_member_lines(member_ids, names, limit):
+    lines = []
+    for index, member_id in enumerate(member_ids[:limit], 1):
+        line = f"{index}. {names[member_id]}"
+        if len("\n".join(lines + [line])) > 900:
+            break
+        lines.append(line)
+    hidden_count = len(member_ids) - len(lines)
+    if hidden_count:
+        lines.append(f"… 외 {hidden_count}명 (`참가자 보기`에서 전체 확인)")
+    return lines
 
 
 def escape_event_text(value):
@@ -2319,9 +2343,10 @@ async def build_event_embed(data, guild):
     status_text = "🟢 모집 중" if status == "open" else "🔴 모집 마감"
     color = discord.Color(0xF2C94C) if status == "open" else discord.Color.dark_grey()
     member_ids = [str(user_id) for user_id in data.get("member_ids", [])]
+    confirmed_ids, waitlist_ids = split_event_members(member_ids)
     creator_id = str(data.get("creator_id", ""))
     member_names = await get_party_member_names(
-        guild, member_ids[:EVENT_PUBLIC_MEMBER_LIMIT] + [creator_id]
+        guild, confirmed_ids[:EVENT_PUBLIC_MEMBER_LIMIT] + waitlist_ids + [creator_id]
     )
     scheduled_at = as_utc(data["scheduled_at"])
     scheduled_timestamp = int(scheduled_at.timestamp())
@@ -2337,7 +2362,11 @@ async def build_event_embed(data, guild):
     )
     embed.set_author(name="VALJJONJAM SPECIAL EVENT")
     embed.add_field(name="모집 상태", value=status_text, inline=True)
-    embed.add_field(name="현재 참가", value=f"**{member_count}명**", inline=True)
+    embed.add_field(
+        name="현재 참가",
+        value=f"**{member_count}명**\n확정 {len(confirmed_ids)} · 대기 {len(waitlist_ids)}",
+        inline=True,
+    )
     embed.add_field(name="주최", value=member_names.get(creator_id, "알 수 없는 사용자"), inline=True)
     embed.add_field(
         name="🎯 참가 티어 조건",
@@ -2360,38 +2389,37 @@ async def build_event_embed(data, guild):
             f"금액: **{entry_fee}**\n"
             f"은행 / 예금주: **{bank_holder}**\n"
             f"계좌번호: `{account_number}`\n\n"
-            "⚠️ **경기가 확정되면 입금 부탁드립니다.**"
+            "⚠️ **참가 확정 명단에 있는 분만, 경기가 확정되면 입금 부탁드립니다.**"
         )
     else:
         fee_text = "☐ 있음　☑️ **없음**"
     embed.add_field(name="💳 참가비", value=fee_text, inline=False)
 
-    member_lines = []
-    for index, member_id in enumerate(member_ids[:EVENT_PUBLIC_MEMBER_LIMIT], 1):
-        line = f"{index}. {member_names[member_id]}"
-        if len("\n".join(member_lines + [line])) > 900:
-            break
-        member_lines.append(line)
-    hidden_count = member_count - len(member_lines)
-    if hidden_count:
-        member_lines.append(f"… 외 {hidden_count}명 (`참가자 보기`에서 전체 확인)")
+    confirmed_lines = event_member_lines(confirmed_ids, member_names, EVENT_PUBLIC_MEMBER_LIMIT)
     embed.add_field(
-        name=f"👥 참가자 명단 ({member_count}명)",
-        value="\n".join(member_lines) if member_lines else "*아직 참가자가 없어요.*",
+        name=f"✅ 참가 확정 ({len(confirmed_ids)}명)",
+        value=(
+            "\n".join(confirmed_lines)
+            if confirmed_lines
+            else f"*{EVENT_CONFIRM_UNIT}명이 모이면 2팀 참가가 확정돼요.*"
+        ),
         inline=False,
     )
+    if waitlist_ids:
+        embed.add_field(
+            name=f"⏳ 대기 ({len(waitlist_ids)}명)",
+            value="\n".join(event_member_lines(waitlist_ids, member_names, EVENT_CONFIRM_UNIT)),
+            inline=False,
+        )
 
     embed.add_field(
         name="팀 구성 현황",
         value=event_team_progress(member_count),
         inline=False,
     )
-    embed.add_field(
-        name="권장 진행 방식",
-        value=event_format_recommendation(member_count),
-        inline=False,
+    embed.set_footer(
+        text=f"{EVENT_CONFIRM_UNIT}명(2팀) 단위로 신청 순서대로 참가가 확정되며, 나머지 인원은 대기로 표시됩니다."
     )
-    embed.set_footer(text="5명 단위로 팀이 구성되며, 나머지 인원은 대기로 표시됩니다.")
     return embed
 
 
@@ -2535,11 +2563,15 @@ class EventView(discord.ui.View):
                     utc_now(),
                 )
 
+            state_text = ""
+            if result in {"joined", "already"}:
+                member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
+                state_text = " " + event_member_state_text(member_ids, user_id)
             messages = {
                 "missing": "❌ 이미 삭제된 이벤트예요.",
                 "closed": "❌ 이미 모집이 마감된 이벤트예요.",
-                "already": "ℹ️ 이미 이벤트에 참가하고 있어요.",
-                "joined": "🏆 발쫀전 참가 신청을 완료했어요!",
+                "already": "ℹ️ 이미 이벤트에 참가하고 있어요." + state_text,
+                "joined": "🏆 발쫀전 참가 신청을 완료했어요!" + state_text,
                 "tier_restricted": tier_error,
             }
             refresh_warning = ""
@@ -2626,7 +2658,14 @@ class EventView(discord.ui.View):
                 return
 
             names = await get_party_member_names(interaction.guild, member_ids)
-            lines = [f"{index}. {names[member_id]}" for index, member_id in enumerate(member_ids, 1)]
+            confirmed_ids, waitlist_ids = split_event_members(member_ids)
+            lines = [f"**✅ 참가 확정 ({len(confirmed_ids)}명)**"]
+            lines += [f"{index}. {names[member_id]}" for index, member_id in enumerate(confirmed_ids, 1)]
+            if not confirmed_ids:
+                lines.append(f"{EVENT_CONFIRM_UNIT}명이 모이면 2팀 참가가 확정돼요.")
+            if waitlist_ids:
+                lines.append(f"**⏳ 대기 ({len(waitlist_ids)}명)**")
+                lines += [f"{index}. {names[member_id]}" for index, member_id in enumerate(waitlist_ids, 1)]
             await send_ephemeral_log(
                 interaction,
                 f"🏆 **{escape_event_text(data['name'])} 참가자 · {len(member_ids)}명**",
