@@ -9,5 +9,6 @@ venv/
 .venv/
 
 # 에디터/시스템
-.claude/
+.claude/*
+!.claude/skills/
 .DS_Store

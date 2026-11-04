@@ -8,7 +8,7 @@
 
 - 발로란트 커뮤니티 **발쫀잼**의 Discord 운영 봇입니다. 멤버 등록, 역할·닉네임 관리, 파티·이벤트 모집을 담당합니다.
 - 이 폴더는 독립 Git 저장소이며 기본 브랜치는 `main`입니다. 원격: `BeautyRiver/Valjjonjam_bot_Discord`.
-- 연동 웹은 형제 폴더 `../valjjonjam-map-wheel`의 **발쫀잼 툴킷**입니다. 별도 저장소이므로 커밋·푸시도 따로 합니다.
+- 연동 웹은 형제 폴더 `../Valjjonjam-toolkit`의 **발쫀잼 툴킷**입니다(원격: `BeautyRiver/Valjjonjam-toolkit`, 이전 이름 `valjjonjam-map-wheel`). 별도 저장소이므로 커밋·푸시도 따로 합니다.
 - 상위 폴더에서 두 저장소의 변경을 한꺼번에 커밋하지 마세요. `git -C <프로젝트 폴더> ...` 또는 해당 폴더에서 작업합니다.
 - 사용자에게는 **한국어**로 설명하고 커밋 메시지도 한국어로 작성합니다.
 - 작업 완료 후 **“커밋·푸시 진행할까요?”**라고 묻습니다. 해당 작업에 사용자가 이미 명시적으로 승인했다면 반복 질문 없이 진행합니다. 이전 작업의 승인을 새 작업에 재사용하지 않습니다.
@@ -34,6 +34,7 @@
 | 웹 공개 데이터 동기화 | `build_toolkit_recruitment_data`, `*_recruitment_pair`, `backfill_toolkit_recruitments_sync` |
 | 자동 정리 | `cleanup_parties`, `close_started_events`, `on_raw_message_delete` |
 | 테스트 | `tests/test_event_tiers.py` |
+| 패치 후 점검 skill | `.agents/skills/bot-check/` (Claude는 `.claude/skills/bot-check/`가 이 파일을 가리킴) |
 | 서버 업데이트 | `Guide.txt`, `Update-Bot.cmd`, `Update-Bot.ps1` |
 
 `on_ready`는 영구 View 등록, 기존 모집글 갱신, 공개 미러 백필, 정리 루프 시작, 명령어 sync를 수행합니다.
@@ -132,6 +133,10 @@ git diff --check
 
 테스트는 `discord.py`가 필요합니다. AST로 허용한 정의만 가져오고 실제 Discord UI 클래스와 가짜 DB/응답으로 검사합니다. 토큰·서비스 계정 파일을 읽거나 운영 네트워크에 연결하지 않습니다.
 현재 회귀 테스트 15개는 이벤트 티어 조합·미등록·? 처리·transaction·참가비 양쪽 생성 흐름·비공개 참가 안내를 다룹니다. 봇의 모든 기능을 검증하는 테스트는 아닙니다.
+
+패치 후에는 `bot-check` skill(Claude `/bot-check`, Codex는 `.agents/skills`에서 인식)로 위 검사를 한 번에 실행할 수 있습니다.
+`python .agents/skills/bot-check/scripts/bot_check.py [--base origin/main]`은 `bot.py`를 실행·import하지 않고 문법·`git diff --check`·회귀 테스트를 돌린 뒤, 공개 미러의 비밀 필드 누출, 내부 티어 점수·이름, `EVENT_TIER_MODES`, 컬렉션 이름, 고정 버튼 `custom_id`의 변경 전후와 웹 `INTERNAL_TIER_INFO` 점수 일치 여부를 보고합니다.
+pyright는 설치된 경우에만 실행하며, 기준선(`pyright-baseline.json`) 저장 후에는 새 진단만 보고합니다. 커밋·푸시·배포는 하지 않습니다.
 
 배포는 `Guide.txt`를 기준으로 별도 승인 후 수행합니다.
 - 로컬 `Update-Bot.cmd` → `Update-Bot.ps1`이 GCP SSH로 서버의 `~/bot`에서 `git pull --ff-only origin main` 후 `systemctl restart valjjonjam`, 실행 상태를 확인합니다.
