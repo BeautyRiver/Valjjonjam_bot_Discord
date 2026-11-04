@@ -28,8 +28,10 @@ CONSTANTS = {
     "DB_SAVE_FAILED_NOTICE", "recruitment_channel_ids", "recruitment_channel_loaded_guilds",
     "PARTY_COLLECTION", "PARTY_MAX_MEMBERS", "INHOUSE_PARTY_MAX_MEMBERS", "SUPPORTED_PARTY_SIZES",
     "PARTY_DELETE_DELAY", "PARTY_PUBLIC_WAITLIST_LIMIT", "PARTY_PREFERRED_TIER_LABELS",
+    "EMBED_TITLE_LIMIT", "EMBED_DESCRIPTION_LIMIT",
 }
 DEFINITIONS = {
+    "missing_send_permissions", "bot_say",
     "remember_recruitment_channel", "is_recruitment_channel", "on_app_command_error",
     "block_if_bot_target", "update_internal_tier",
     "party_max_members", "party_type_name", "party_preferred_tier_name", "party_status",
@@ -760,6 +762,59 @@ class RecruitmentManagementTests(unittest.IsolatedAsyncioTestCase):
             await ns["update_internal_tier"](call, target, None)
             ref.set.assert_called_with({"internal_tier": None, "updated_at": "SERVER_TIMESTAMP"}, merge=True)
             self.assertIn("미분류", call.followup.send.call_args.args[0])
+
+
+class BotSayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.log = Mock()
+        self.patch = patch.dict(ns, {"log": self.log})
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def call(self, **permissions):
+        call = interaction()
+        allowed = {"view_channel": True, "send_messages": True, "embed_links": True}
+        allowed.update(permissions)
+        call.app_permissions = discord.Permissions(**allowed)
+        call.channel = SimpleNamespace(send=AsyncMock())
+        call.channel_id = 200
+        return call
+
+    async def test_missing_channel_permissions_are_named_before_sending(self):
+        call = self.call(embed_links=False, send_messages=False)
+        await ns["bot_say"](call, "공지 내용")
+        message = call.response.send_message.call_args.args[0]
+        self.assertIn("`메시지 보내기`, `링크 첨부`", message)
+        call.channel.send.assert_not_awaited()
+
+    async def test_message_is_sent_after_deferring(self):
+        call = self.call()
+        await ns["bot_say"](call, "첫 줄\\n둘째 줄", "공지")
+        call.response.defer.assert_awaited_once_with(ephemeral=True)
+        embed = call.channel.send.call_args.kwargs["embed"]
+        self.assertEqual((embed.title, embed.description), ("공지", "첫 줄\n둘째 줄"))
+        self.assertIn("보냈어요", call.followup.send.call_args.args[0])
+
+    async def test_forbidden_from_discord_is_explained_not_raised(self):
+        call = self.call()
+        call.channel.send.side_effect = http_error(discord.Forbidden, 403)
+        await ns["bot_say"](call, "공지 내용")
+        self.assertIn("권한 문제로 보내지 못했어요", call.followup.send.call_args.args[0])
+        self.log.warning.assert_called_once()
+
+    async def test_too_long_and_preview_do_not_send_to_channel(self):
+        call = self.call()
+        await ns["bot_say"](call, "가" * 4097)
+        self.assertIn("4,096자", call.response.send_message.call_args.args[0])
+        call = self.call(embed_links=False)
+        await ns["bot_say"](call, "공지 내용", 미리보기=True)
+        self.assertIn("미리보기", call.response.send_message.call_args.kwargs["content"])
+        call.channel.send.assert_not_awaited()
+
+    def test_threads_require_thread_send_permission(self):
+        permissions = discord.Permissions(view_channel=True, send_messages=True, embed_links=True)
+        self.assertEqual(ns["missing_send_permissions"](permissions), [])
+        self.assertEqual(ns["missing_send_permissions"](permissions, in_thread=True), ["스레드에서 메시지 보내기"])
 
 
 if __name__ == "__main__":

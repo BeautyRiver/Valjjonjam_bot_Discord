@@ -518,6 +518,23 @@ async def create_roles(interaction: discord.Interaction):
     else:
         await interaction.followup.send("이미 모든 역할이 존재합니다!", ephemeral=True)
         
+# Discord 임베드 글자 수 제한
+EMBED_TITLE_LIMIT = 256
+EMBED_DESCRIPTION_LIMIT = 4096
+
+
+# 채널에 임베드를 보내는 데 필요한데 봇에게 없는 권한 이름 목록 (스레드는 스레드 전송 권한 확인)
+def missing_send_permissions(permissions, in_thread=False):
+    required = [
+        ("view_channel", "채널 보기"),
+        ("send_messages_in_threads", "스레드에서 메시지 보내기")
+        if in_thread
+        else ("send_messages", "메시지 보내기"),
+        ("embed_links", "링크 첨부"),
+    ]
+    return [label for name, label in required if not getattr(permissions, name)]
+
+
 @bot.tree.command(name="메세지", description="봇이 현재 채널에 임베드 메세지를 보냅니다")
 @app_commands.describe(
     내용="보낼 내용 (줄바꿈은 \\n 으로 입력)",
@@ -528,7 +545,16 @@ async def create_roles(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = None, 미리보기: bool = False):
     # 슬래시 입력은 줄바꿈을 못 넣으니 \n 표기를 실제 줄바꿈으로 변환
-    embed = discord.Embed(description=내용.replace("\\n", "\n"), color=discord.Color.blurple())
+    description = 내용.replace("\\n", "\n")
+    if len(description) > EMBED_DESCRIPTION_LIMIT or len(제목 or "") > EMBED_TITLE_LIMIT:
+        await interaction.response.send_message(
+            f"❌ 제목은 {EMBED_TITLE_LIMIT}자, 내용은 {EMBED_DESCRIPTION_LIMIT:,}자까지 보낼 수 있어요. "
+            f"(현재 제목 {len(제목 or '')}자 · 내용 {len(description):,}자)",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(description=description, color=discord.Color.blurple())
     if 제목:
         embed.title = 제목
 
@@ -540,8 +566,31 @@ async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = N
         )
         return
 
-    await interaction.channel.send(embed=embed)
-    await interaction.response.send_message("✅ 메세지를 보냈어요!", ephemeral=True)
+    # 보내기 전에 이 채널에서 봇이 가진 권한(app_permissions)을 확인해 빠진 권한을 알려줌
+    missing = missing_send_permissions(
+        interaction.app_permissions, isinstance(interaction.channel, discord.Thread)
+    )
+    if missing:
+        await interaction.response.send_message(
+            f"❌ 봇에게 이 채널의 {', '.join(f'`{label}`' for label in missing)} 권한이 없어 보낼 수 없어요.\n"
+            "채널 편집 → 권한에서 발쫀봇 역할에 허용해주세요. (카테고리 권한에 막혀 있을 수도 있어요)",
+            ephemeral=True,
+        )
+        return
+
+    # 먼저 응답해 두고 보내서, 전송이 늦어도 '응답 없음' 오류가 나지 않게 함
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.channel.send(embed=embed)
+    except discord.Forbidden as e:
+        log.warning("메세지 전송 권한 부족 — channel=%s code=%s", interaction.channel_id, e.code)
+        await interaction.followup.send(
+            "❌ 권한 문제로 보내지 못했어요. 채널·카테고리 권한에서 발쫀봇의 "
+            "`채널 보기`, `메시지 보내기`, `링크 첨부`를 확인해주세요.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send("✅ 메세지를 보냈어요!", ephemeral=True)
 
 
 @bot.tree.command(name="미인증안내", description="인증됨 역할이 없는 멤버 전원에게 기본설정 안내 DM을 보냅니다")
