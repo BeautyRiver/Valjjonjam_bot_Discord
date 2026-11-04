@@ -25,9 +25,17 @@ CONSTANTS = {
     "EVENT_CONFIRM_UNIT", "EVENT_REFRESH_WINDOW", "PARTY_TIMEZONE",
     "EVENT_COLLECTION", "TOOLKIT_RECRUITMENT_COLLECTION",
     "ROLE_FAILED_NOTICE", "NICKNAME_FORBIDDEN_NOTICE", "NICKNAME_FAILED_NOTICE",
-    "DB_SAVE_FAILED_NOTICE",
+    "DB_SAVE_FAILED_NOTICE", "recruitment_channel_ids", "recruitment_channel_loaded_guilds",
+    "PARTY_COLLECTION", "PARTY_MAX_MEMBERS", "INHOUSE_PARTY_MAX_MEMBERS", "SUPPORTED_PARTY_SIZES",
+    "PARTY_DELETE_DELAY", "PARTY_PUBLIC_WAITLIST_LIMIT", "PARTY_PREFERRED_TIER_LABELS",
 }
 DEFINITIONS = {
+    "remember_recruitment_channel", "is_recruitment_channel", "on_app_command_error",
+    "block_if_bot_target", "update_internal_tier",
+    "party_max_members", "party_type_name", "party_preferred_tier_name", "party_status",
+    "join_party_transaction", "leave_party_transaction", "get_party_data", "build_party_embed",
+    "PartyView", "get_event_data", "delete_recruitment", "DeleteConfirmView",
+    "EventMemberRemoveView",
     "make_tier", "resolve_tier", "build_nickname", "get_or_create_verified_role",
     "apply_tier_roles", "apply_nickname", "save_user_profile",
     "MajorTierSelect", "DivisionSelect", "RoleSelect", "TierRoleView",
@@ -35,7 +43,7 @@ DEFINITIONS = {
     "NicknameModal", "list_open_events", "list_recent_events",
     "utc_now", "as_utc", "event_tier_choices", "event_tier_score",
     "validate_event_tier_restriction", "event_tier_restriction_text",
-    "event_tier_join_error", "event_status", "escape_event_text",
+    "event_tier_join_error", "event_status", "escape_display_text",
     "build_toolkit_recruitment_data", "get_toolkit_recruitment_ref",
     "set_recruitment_pair", "delete_recruitment_pair", "join_event_transaction",
     "leave_event_transaction", "set_event_registration_transaction",
@@ -60,6 +68,7 @@ ns = {
     "discord": discord, "asyncio": asyncio, "datetime": datetime,
     "timedelta": timedelta, "timezone": timezone, "log": logging.getLogger(__name__),
     "firestore": SimpleNamespace(SERVER_TIMESTAMP="SERVER_TIMESTAMP"),
+    "app_commands": discord.app_commands,
 }
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source_path), "exec"), ns)
 
@@ -95,6 +104,10 @@ class FakeTransaction:
     def set(self, ref, data):
         self.writes.append(("set", ref.path, deepcopy(data)))
         self.database.documents[ref.path] = deepcopy(data)
+
+    def delete(self, ref):
+        self.writes.append(("delete", ref.path, None))
+        self.database.documents.pop(ref.path, None)
 
     def commit(self):
         pass
@@ -554,6 +567,199 @@ class EventQueryTests(unittest.TestCase):
             ns["list_recent_events"](now)
             where.assert_called_with(filter=("scheduled_at", ">=", now - timedelta(days=1)))
         db.collection.assert_called_with("events")
+
+
+def party_data(max_members=5, scheduled_in=timedelta(hours=1)):
+    return {
+        "name": "테스트 파티", "creator_id": "1", "member_ids": ["1"], "waitlist_ids": [],
+        "guild_id": "100", "channel_id": "200", "message_id": "99", "status": "open",
+        "max_members": max_members, "preferred_tier": "free",
+        "scheduled_at": datetime.now(timezone.utc) + scheduled_in,
+    }
+
+
+class PartyTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDatabase()
+        self.db.documents["parties/99"] = party_data()
+        self.patch = patch.dict(ns, {"db": self.db})
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def refs(self):
+        return (
+            self.db.transaction(), self.db.collection("parties").document("99"),
+            self.db.collection("toolkit_recruitments").document("party_99"),
+        )
+
+    def join(self, user_id):
+        return ns["join_party_transaction"](*self.refs(), user_id, datetime.now(timezone.utc))
+
+    def leave(self, user_id):
+        return ns["leave_party_transaction"](*self.refs(), user_id, datetime.now(timezone.utc))
+
+    def test_full_party_waitlists_and_promotes_in_fifo_order(self):
+        for user_id in ("2", "3", "4", "5"):
+            self.assertEqual(self.join(user_id)[0], "joined")
+        self.assertEqual(self.join("6")[::2], ("waitlisted", 1))
+        self.assertEqual(self.join("7")[::2], ("waitlisted", 2))
+        self.assertEqual(self.join("6")[::2], ("already_waitlist", 1))
+        self.assertEqual(self.join("3")[0], "already_member")
+
+        result, data, promoted_id = self.leave("3")
+        self.assertEqual((result, promoted_id), ("left_promoted", "6"))
+        self.assertEqual(data["member_ids"], ["1", "2", "4", "5", "6"])
+        self.assertEqual(data["waitlist_ids"], ["7"])
+        self.assertEqual(data["status"], "full")
+        mirror = self.db.documents["toolkit_recruitments/party_99"]
+        self.assertEqual((mirror["member_ids"], mirror["waitlist_ids"]), (data["member_ids"], ["7"]))
+
+    def test_creator_waitlist_and_unknown_leave_results(self):
+        for user_id in ("2", "3", "4", "5", "6"):
+            self.join(user_id)
+        self.assertEqual(self.leave("1")[0], "creator")
+        self.assertEqual(self.leave("6")[0], "waitlist_left")
+        self.assertEqual(self.leave("8")[0], "not_member")
+        result, data, promoted_id = self.leave("2")
+        self.assertEqual((result, promoted_id, data["status"]), ("left", None, "open"))
+
+    def test_started_party_rejects_join_and_leave(self):
+        self.db.documents["parties/99"] = party_data(scheduled_in=-timedelta(minutes=1))
+        self.assertEqual(self.join("2")[0], "closed")
+        self.assertEqual(self.leave("1")[0], "closed")
+        self.assertEqual(self.db.last_transaction.writes, [])
+
+    def test_inhouse_party_holds_ten_before_waitlisting(self):
+        self.db.documents["parties/99"] = party_data(max_members=10)
+        results = [self.join(str(user_id))[0] for user_id in range(2, 12)]
+        self.assertEqual(results, ["joined"] * 9 + ["waitlisted"])
+
+
+class RecruitmentManagementTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.db = FakeDatabase()
+        self.message = SimpleNamespace(id=99, guild=None, delete=AsyncMock(), edit=AsyncMock())
+        self.log = Mock()
+        self.patch = patch.dict(ns, {
+            "db": self.db, "log": self.log, "party_action_lock": asyncio.Lock(),
+            "event_action_lock": asyncio.Lock(),
+            "block_if_not_in_guild": AsyncMock(return_value=False),
+            "block_if_unverified": AsyncMock(return_value=False),
+            "get_party_member_names": AsyncMock(side_effect=lambda guild, ids: {i: f"멤버{i}" for i in ids}),
+            "try_edit_recruitment_message": AsyncMock(return_value=True),
+        })
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def store_party(self):
+        self.db.documents["parties/99"] = party_data()
+        self.db.documents["toolkit_recruitments/party_99"] = {"kind": "party"}
+
+    async def test_party_delete_button_asks_before_deleting(self):
+        self.store_party()
+        call = interaction()
+        call.message = self.message
+        await ns["PartyView"]().delete_party.callback(call)
+        view = call.followup.send.call_args.kwargs["view"]
+        self.assertIsInstance(view, ns["DeleteConfirmView"])
+        self.assertIn("삭제할까요", call.followup.send.call_args.args[0])
+        self.message.delete.assert_not_awaited()
+        self.assertIn("parties/99", self.db.documents)
+
+    async def test_delete_confirm_and_cancel(self):
+        self.store_party()
+        cancel_view = ns["DeleteConfirmView"](42, self.message, "party", "99", asyncio.Lock())
+        await cancel_view.cancel.callback(interaction())
+        self.message.delete.assert_not_awaited()
+        self.assertFalse(await cancel_view.interaction_check(interaction(user_id=7)))
+
+        view = ns["DeleteConfirmView"](42, self.message, "party", "99", asyncio.Lock())
+        call = interaction()
+        await view.confirm.callback(call)
+        self.message.delete.assert_awaited_once()
+        self.assertNotIn("parties/99", self.db.documents)
+        self.assertNotIn("toolkit_recruitments/party_99", self.db.documents)
+        self.assertIn("삭제했어요", call.edit_original_response.call_args.kwargs["content"])
+
+    async def test_waitlisted_member_sees_position_when_joining_again(self):
+        data = party_data()
+        data.update(member_ids=["1", "2", "3", "4", "5"], waitlist_ids=["8", "42"])
+        self.db.documents["parties/99"] = data
+        call = interaction()
+        await ns["PartyView"]().join_party.callback(call)
+        self.assertIn("대기 명단 2번", call.followup.send.call_args.args[0])
+
+    async def test_admin_can_remove_event_member_even_after_close(self):
+        data = event_data()
+        data.update(member_ids=["10", "42", "11"], status="closed")
+        self.db.documents["events/99"] = data
+        view = ns["EventMemberRemoveView"](1, self.message)
+        self.assertTrue(view.remove.disabled)
+        view.target = SimpleNamespace(id=42, display_name="참가자")
+        call = interaction()
+        await view.remove.callback(call)
+        self.assertEqual(self.db.documents["events/99"]["member_ids"], ["10", "11"])
+        self.assertEqual(self.db.documents["toolkit_recruitments/event_99"]["waitlist_ids"], ["10", "11"])
+        self.assertIn("제외했어요", call.edit_original_response.call_args.kwargs["content"])
+
+        view = ns["EventMemberRemoveView"](1, self.message)
+        view.target = SimpleNamespace(id=42, display_name="참가자")
+        call = interaction()
+        await view.remove.callback(call)
+        self.assertIn("참가하고 있지 않아요", call.edit_original_response.call_args.kwargs["content"])
+
+    async def test_member_cannot_leave_closed_event_by_themselves(self):
+        data = event_data()
+        data.update(member_ids=["42"], status="closed")
+        self.db.documents["events/99"] = data
+        result, _ = ns["leave_event_transaction"](
+            self.db.transaction(), self.db.collection("events").document("99"),
+            self.db.collection("toolkit_recruitments").document("event_99"),
+            "42", datetime.now(timezone.utc),
+        )
+        self.assertEqual(result, "closed")
+
+    async def test_message_delete_checks_only_recruitment_channels(self):
+        lookup = Mock(return_value="200")
+        with patch.dict(ns, {
+            "get_party_channel_id": lookup, "recruitment_channel_ids": set(),
+            "recruitment_channel_loaded_guilds": set(),
+        }):
+            self.assertTrue(await ns["is_recruitment_channel"](100, 200))
+            self.assertFalse(await ns["is_recruitment_channel"](100, 300))
+            self.assertFalse(await ns["is_recruitment_channel"](None, 200))
+            lookup.assert_called_once_with("100")
+            ns["remember_recruitment_channel"](300)
+            self.assertTrue(await ns["is_recruitment_channel"](100, 300))
+
+    async def test_command_errors_are_answered_and_logged(self):
+        call = interaction()
+        call.response.is_done = Mock(return_value=False)
+        await ns["on_app_command_error"](call, discord.app_commands.MissingPermissions(["administrator"]))
+        self.assertIn("어드민만", call.response.send_message.call_args.args[0])
+        self.log.error.assert_not_called()
+
+        call = interaction()
+        call.response.is_done = Mock(return_value=True)
+        call.command = SimpleNamespace(name="역할생성")
+        await ns["on_app_command_error"](call, discord.app_commands.AppCommandError("boom"))
+        self.assertIn("오류가 발생했어요", call.followup.send.call_args.args[0])
+        self.log.error.assert_called_once()
+
+    async def test_internal_tier_set_and_reset_share_one_flow(self):
+        db = Mock()
+        ref = db.collection.return_value.document.return_value
+        ref.get.return_value = SimpleNamespace(exists=True, to_dict=lambda: {"name": "홍길동"})
+        target = SimpleNamespace(id=42, bot=False, display_name="홍길동")
+        with patch.dict(ns, {"db": db}):
+            call = interaction()
+            await ns["update_internal_tier"](call, target, "3상")
+            ref.set.assert_called_with({"internal_tier": "3상", "updated_at": "SERVER_TIMESTAMP"}, merge=True)
+            self.assertIn("11점", call.followup.send.call_args.args[0])
+            call = interaction()
+            await ns["update_internal_tier"](call, target, None)
+            ref.set.assert_called_with({"internal_tier": None, "updated_at": "SERVER_TIMESTAMP"}, merge=True)
+            self.assertIn("미분류", call.followup.send.call_args.args[0])
 
 
 if __name__ == "__main__":

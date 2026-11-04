@@ -28,17 +28,19 @@
 | --- | --- |
 | 로그인·시작 작업 | 파일 상단 Firebase 초기화, `on_ready`, 파일 끝 `bot.run` |
 | 멤버 등록·인증 | `BasicSetupModal`, `BasicSetupView`, `TierRoleView`, `VERIFIED_ROLE`, `apply_tier_roles`, `apply_nickname`, `save_user_profile` |
-| 내부 티어 | `INTERNAL_TIER_LABELS`, `INTERNAL_TIER_SCORES`, `set_internal_tier` |
-| 일반 파티 | `PartyView`, `PartyCreationView`, `PartyTimeEditView`, `join_party_transaction`, `leave_party_transaction` |
-| 이벤트·티어 제한 | `EventFeeSelectionView`, `EventDetailsModal`, `EventCreationView`, `EventView`, `event_tier_*` |
+| 내부 티어 | `INTERNAL_TIER_LABELS`, `INTERNAL_TIER_SCORES`, `set_internal_tier`, `update_internal_tier` |
+| 일반 파티 | `PartyView`, `PartyCreationView`, `PartyTimeEditView`, `join_party_transaction`, `leave_party_transaction`, `DeleteConfirmView` |
+| 이벤트·티어 제한 | `EventFeeSelectionView`, `EventDetailsModal`, `EventCreationView`, `EventView`, `EventMemberRemoveView`, `event_tier_*` |
 | 웹 공개 데이터 동기화 | `build_toolkit_recruitment_data`, `*_recruitment_pair`, `backfill_toolkit_recruitments_sync` |
-| 자동 정리 | `cleanup_parties`, `close_started_events`, `on_raw_message_delete` |
+| 자동 정리 | `cleanup_parties`, `close_started_events`, `on_raw_message_delete`, `is_recruitment_channel` |
+| 명령어 공통 오류 | `on_app_command_error`, `commands.Bot(allowed_contexts=...)` |
 | 테스트 | `tests/test_event_tiers.py` |
 | 패치 후 점검 skill | `.agents/skills/bot-check/` (Claude는 `.claude/skills/bot-check/`가 이 파일을 가리킴) |
 | 서버 업데이트 | `Guide.txt`, `Update-Bot.cmd`, `Update-Bot.ps1` |
 
 `on_ready`는 영구 View 등록, 기존 모집글 갱신, 공개 미러 백필, 정리 루프 시작, 명령어 sync를 수행합니다.
 재시작 후 기존 메시지 버튼이 작동해야 하므로 `custom_id`와 persistent View 동작을 보존하세요.
+고정 `custom_id`: `party:join|leave|change_time|delete`, `event:join|leave|members|close|reopen|delete|remove_member`.
 
 ## 3. 현재 기능과 유지해야 할 동작
 
@@ -49,19 +51,23 @@
 - `/기본설정`·`/역할설정`·`/닉네임변경`(대리 포함)은 같은 공용 함수로 역할(add/remove 방식)·닉네임을 적용하고 `users`에 병합 저장합니다. Discord 반영 → DB 저장 → 결과 안내 순서이며, 역할·닉네임 실패(권한 부족, 금지 단어 등)나 DB 저장 실패는 성공 안내 아래 경고로 표시하고 로그를 남깁니다. 역할이나 닉네임이 실패해도 입력 정보는 저장합니다.
 - `/대리기본설정`, `/대리역할설정`, `/대리닉네임변경`: 관리자용 대리 수정.
 - `/내부티어설정`: 관리자용 내부 티어 수정. `미분류` 선택도 지원하며 DB에 `null`을 저장합니다.
-- `/내부티어초기화`: 내부 티어만 미분류로 초기화합니다. 다른 멤버 필드를 지우지 않습니다.
-- `/역할생성`, `/메세지`, `/미인증안내`, `/탈퇴정리`: 운영 명령어. 권한 검사와 실제 부작용을 읽고 사용하세요.
+- `/내부티어초기화`: 내부 티어만 미분류로 초기화합니다. 다른 멤버 필드를 지우지 않습니다. `/내부티어설정`의 미분류 선택과 같은 `update_internal_tier`를 사용합니다.
+- `/역할생성`, `/메세지`, `/미인증안내`, `/탈퇴정리`: 운영 명령어. 권한 검사와 실제 부작용을 읽고 사용하세요. `/미인증안내`는 일부 DM 전송이 실패해도 나머지 멤버에게 계속 보내고 실패 수를 보고합니다.
+- 모든 슬래시 명령어는 `allowed_contexts`로 **서버 안에서만** 노출됩니다. 권한 부족·그 밖의 명령어 오류는 `@bot.tree.error` 공통 처리기가 비공개로 안내하고 로그를 남깁니다. 명령어별 `.error` 처리기를 다시 추가하지 마세요(공통 처리기와 중복 응답).
+- `/닉네임변경`·`/대리닉네임변경`의 기존 정보 조회는 `asyncio.to_thread`로 실행합니다.
 - 새 멤버에게 기본설정 안내 DM을 보내고 실패 시 시스템 채널로 안내합니다. 역할이 없다는 이유로 자동 강퇴하지 않습니다.
 - `/탈퇴정리`는 캐시와 Discord API로 부재를 확인한 계정의 `users` 문서를 삭제하고, 삭제·조회 보류 명단을 실행자에게 비공개로 전달합니다.
 
 ### 일반 파티
 
-- `/파티채널설정`: 서버별 모집 채널 ID를 저장합니다. 새 채널을 만드는 명령이 아닙니다.
+- `/파티채널설정`: 서버별 모집 채널 ID를 저장합니다(파티·발쫀전 공용). 새 채널을 만드는 명령이 아닙니다.
 - `/파티생성`: 지정 채널에서 **5인큐 / 일반 내전 10명** 선택 → 날짜·시간 선택. 파티장은 자동 참가합니다.
 - 여러 파티에 동시에 참가할 수 있습니다. 같은 파티 중복 참가는 차단합니다.
 - 정원 초과자는 `waitlist_ids`에 등록하고 빈자리가 생기면 FIFO 순서로 참가 확정·DM 알림을 처리합니다.
 - 5인큐만 희망 티어대 선택을 제공합니다. 이는 **안내일 뿐 참가 제한이 아닙니다.** 10명 내전에는 없습니다.
 - 시작 시간 변경과 삭제는 파티장·관리자 권한을 검사합니다. 시간 변경 시 확정자와 대기자에게 DM을 시도하며 변경 실행자는 제외합니다.
+- `파티 삭제`·`이벤트 삭제`는 바로 지우지 않고 실행자에게만 보이는 확인 화면(`DeleteConfirmView`, 60초)에서 한 번 더 눌러야 삭제됩니다.
+- 이미 대기 중인 사람이 다시 참가를 누르면 현재 대기 순번을 알려줍니다. 사용자가 입력한 파티 이름은 `escape_display_text`로 마크다운·멘션을 무력화해 표시합니다.
 - 시작 시간은 현재부터 최소 10분 이후, 최대 24시간 이내. 시작되면 참가 마감, **시작 시각 + 10시간** 후 삭제 대상입니다. 정리 루프는 5분 주기입니다.
 - 멤버 표시는 `get_party_member_names`가 조회한 닉네임 텍스트를 사용합니다. 모바일에서 ID 숫자로 보였던 문제를 피하려고 멘션 문자열에만 의존하지 않습니다.
 
@@ -72,9 +78,10 @@
 - 상품, 안내/규칙, 참가비 여부를 입력합니다. 참가비가 있으면 금액·은행/예금주·계좌번호를 받습니다. 봇이 입금·결제 처리까지 하는 것은 아닙니다.
 - 홀수 팀을 만들지 않도록 신청 순서대로 **10명(2팀) 단위로만 참가 확정**하고 나머지는 대기로 표시합니다(13명 → 확정 10·대기 3, 20명 → 확정 20). `split_event_members`가 화면에서 계산할 뿐 원본 `member_ids`에는 신청 순서 전체를 그대로 저장합니다. 확정자가 취소하면 다음 신청자가 자동으로 확정으로 올라가며, 이에 대한 DM 알림은 없습니다. 10명 단위가 깨지면 그 단위 전체가 대기로 돌아갑니다(10명 중 1명 취소 → 9명 모두 대기).
 - 모집글에는 참가 확정·대기 명단과 팀 구성 현황을 표시하고, 참가 시 본인에게 확정 또는 대기 순번을 비공개로 안내합니다. 참가비 안내는 참가 확정자만 입금하도록 표시합니다. 과거의 "권장 진행 방식" 안내는 제거했습니다. 봇이 직접 밸런스 팀을 확정하는 것은 아닙니다.
-- 참가·취소·전체 참가자 보기, 관리자 모집 마감·재개·삭제를 제공합니다.
+- 참가·취소·전체 참가자 보기, 관리자 모집 마감·재개·삭제·**참가자 제외**를 제공합니다. 본인 취소는 모집 마감 후 불가하지만, 관리자 `참가자 제외`(`EventMemberRemoveView`, 사용자 선택 후 확인)는 마감·시작 후에도 가능하고 비운 자리는 다음 신청자가 순서대로 채웁니다. 제외 대상에게 DM은 보내지 않습니다.
 - 시작 시각은 최소 10분 이후~14일 이내. 시작 이벤트는 1분 주기로 마감하며, 일반 파티의 10시간 자동 삭제 정책을 이벤트에 적용하지 않습니다.
 - 이벤트 문서가 계속 쌓이므로 자동 마감 루프는 `status == "open"` 이벤트만, 재시작 시 모집글 갱신은 `scheduled_at`이 현재 기준 1일 전 이후인 이벤트만 조회합니다(`list_open_events`, `list_recent_events`, 단일 필드 자동 색인 사용). 그보다 오래된 이벤트의 모집글·DB는 재시작 때 다시 정리하지 않습니다.
+- 모집글을 Discord에서 직접 지우면 DB(원본·미러)도 정리합니다. 메시지 삭제마다 DB를 읽지 않도록 설정된 모집 채널과 모집글이 올라간 채널(실행 중 메모리 캐시, `is_recruitment_channel`)에서 지워진 메시지만 확인합니다. 재시작 때 모집글이 사라진 파티·최근 이벤트는 DB도 정리합니다.
 - 참가 제한은 `none` / `valorant` / `internal` 중 **하나**입니다. 첫 생성 화면에서 조건 선택 후 참가비·상세 정보·시간 입력으로 이어집니다.
 - 발로란트 제한은 **직접 등록한 최대 티어** 기준입니다. Riot API의 실시간 현재 랭크가 아닙니다. 범위에 속한 티어의 1~3을 모두 포함하며 언랭·미등록은 등록 안내 후 차단합니다.
 - 내부 티어 제한은 아래 점수표로 비교합니다. 미분류·미등록은 등록 안내 후 차단하고 `?`는 같은 티어의 하로 판정합니다. 경계 선택지는 중복되는 `?` 대신 하를 사용합니다.
@@ -135,7 +142,7 @@ git diff --check
 ```
 
 테스트는 `discord.py`가 필요합니다. AST로 허용한 정의만 가져오고 실제 Discord UI 클래스와 가짜 DB/응답으로 검사합니다. 토큰·서비스 계정 파일을 읽거나 운영 네트워크에 연결하지 않습니다.
-현재 회귀 테스트 26개는 이벤트 티어 조합·미등록·? 처리·transaction·참가비 양쪽 생성 흐름·비공개 참가 안내, 이벤트 10명 단위 확정·대기 표시·미러 분리, 기본설정·역할설정·닉네임변경의 역할·닉네임·DB 저장 실패 안내, 이벤트 조회 범위를 다룹니다. 봇의 모든 기능을 검증하는 테스트는 아닙니다.
+현재 회귀 테스트 38개는 이벤트 티어 조합·미등록·? 처리·transaction·참가비 양쪽 생성 흐름·비공개 참가 안내, 이벤트 10명 단위 확정·대기 표시·미러 분리, 기본설정·역할설정·닉네임변경의 역할·닉네임·DB 저장 실패 안내, 이벤트 조회 범위, 일반 파티 참가·대기·FIFO 승격·마감, 삭제 확인, 관리자 참가자 제외, 모집 채널 삭제 감지 캐시, 공통 명령어 오류 처리, 내부 티어 저장을 다룹니다. 봇의 모든 기능을 검증하는 테스트는 아닙니다.
 
 패치 후에는 `bot-check` skill(Claude `/bot-check`, Codex는 `.agents/skills`에서 인식)로 위 검사를 한 번에 실행할 수 있습니다.
 `python .agents/skills/bot-check/scripts/bot_check.py [--base origin/main]`은 `bot.py`를 실행·import하지 않고 문법·`git diff --check`·회귀 테스트를 돌린 뒤, 공개 미러의 비밀 필드 누출, 내부 티어 점수·이름, `EVENT_TIER_MODES`, 컬렉션 이름, 고정 버튼 `custom_id`의 변경 전후와 웹 `INTERNAL_TIER_INFO` 점수 일치 여부를 보고합니다.

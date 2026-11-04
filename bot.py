@@ -31,7 +31,12 @@ db = firestore.client()
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# 모든 슬래시 명령어는 서버 안에서만 노출 (봇 DM·그룹 DM에서는 숨김)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False),
+)
 
 # 티어 목록 (실제 디스코드 역할명 = 저장값)
 TIERS = [
@@ -176,6 +181,25 @@ async def block_if_bot_target(interaction, 대상):
         return True
     return False
 
+# 슬래시 명령어 공통 오류 처리 — 권한 부족은 안내, 그 밖의 오류는 로그를 남기고 실패를 알림
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "❌ 어드민만 사용 가능한 명령어입니다!"
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "⚠️ 이 명령어는 **서버 채널 안에서** 사용해주세요!"
+    else:
+        command_name = getattr(interaction.command, "name", "알 수 없음")
+        log.error("명령어 처리 실패 — /%s user=%s", command_name, interaction.user.id, exc_info=error)
+        message = "❌ 명령어 처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        log.exception("명령어 오류 안내 전송 실패")
+
 # 기본설정 안내 문구 (입장 안내 / 전체 안내 공용)
 SETUP_GUIDE = (
     "👋 **발쫀잼 서버에 오신 걸 환영해요!**\n"
@@ -235,11 +259,14 @@ async def on_member_join(member: discord.Member):
     guide = build_setup_guide(member.guild)
     try:
         await member.send(guide)
-    except discord.Forbidden:
-        # DM이 막혀있으면 시스템 채널에 멘션으로 안내
+    except discord.HTTPException:
+        # DM이 막혀있거나 전송에 실패하면 시스템 채널에 멘션으로 안내
         channel = member.guild.system_channel
         if channel and channel.permissions_for(member.guild.me).send_messages:
-            await channel.send(f"{member.mention}\n{guide}")
+            try:
+                await channel.send(f"{member.mention}\n{guide}")
+            except discord.HTTPException:
+                log.exception("입장 안내 전송 실패 — %s(%s)", member, member.id)
 
 # 티어 선택 1단계 - 큰 티어
 class MajorTierSelect(discord.ui.Select):
@@ -363,6 +390,11 @@ async def apply_nickname(member, nickname):
         if isinstance(e, discord.Forbidden):
             return NICKNAME_FORBIDDEN_NOTICE
         return NICKNAME_FAILED_NOTICE
+
+
+def get_user_data(user_id):
+    snapshot = db.collection("users").document(str(user_id)).get()
+    return snapshot.to_dict() if snapshot.exists else {}
 
 
 # users 문서에 병합 저장 (다른 필드는 유지) — 실패하면 로그를 남기고 False
@@ -511,11 +543,6 @@ async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = N
     await interaction.channel.send(embed=embed)
     await interaction.response.send_message("✅ 메세지를 보냈어요!", ephemeral=True)
 
-@bot_say.error
-async def bot_say_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
 
 @bot.tree.command(name="미인증안내", description="인증됨 역할이 없는 멤버 전원에게 기본설정 안내 DM을 보냅니다")
 @app_commands.default_permissions(administrator=True)
@@ -535,19 +562,14 @@ async def announce_unverified(interaction: discord.Interaction):
         try:
             await member.send(guide)
             sent += 1
-        except discord.Forbidden:
-            failed += 1  # DM 차단된 멤버
+        except discord.HTTPException:
+            failed += 1  # DM 차단 또는 일시적인 전송 실패 — 나머지 멤버에게는 계속 보냄
 
     await interaction.followup.send(
         f"📣 미인증자 안내 DM 전송 완료!\n"
-        f"✅ 보냄: {sent}명 | ⏭️ 이미 인증: {skipped}명 | ❌ DM 차단: {failed}명",
+        f"✅ 보냄: {sent}명 | ⏭️ 이미 인증: {skipped}명 | ❌ 전송 실패(DM 차단 등): {failed}명",
         ephemeral=True
     )
-
-@announce_unverified.error
-async def announce_unverified_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
 async def send_ephemeral_log(interaction, title, lines):
@@ -631,11 +653,6 @@ async def cleanup_db(interaction: discord.Interaction):
             [f"• {line}" for line in lookup_failed],
         )
 
-@cleanup_db.error
-async def cleanup_db_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
 
 # ===== 발쫀잼 내부 티어 관리 =====
 
@@ -649,45 +666,8 @@ async def set_internal_tier(
     대상: discord.Member,
     티어: app_commands.Choice[str],
 ):
-    if await block_if_not_in_guild(interaction):
-        return
-    if await block_if_bot_target(interaction, 대상):
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    user_ref = db.collection("users").document(str(대상.id))
-    snapshot = await asyncio.to_thread(user_ref.get)
-    data = snapshot.to_dict() if snapshot.exists else {}
-    if not data.get("name"):
-        await interaction.followup.send(
-            f"❌ **{대상.display_name}** 님의 기본설정 정보가 없어요. `/기본설정`을 먼저 진행해주세요.",
-            ephemeral=True,
-        )
-        return
-
     internal_tier = None if 티어.value == "unclassified" else 티어.value
-    await asyncio.to_thread(
-        user_ref.set,
-        {"internal_tier": internal_tier, "updated_at": firestore.SERVER_TIMESTAMP},
-        merge=True,
-    )
-    if internal_tier is None:
-        await interaction.followup.send(
-            f"✅ **{data['name']}** 님의 발쫀잼 내부 티어를 `미분류`로 설정했어요.",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(
-        f"✅ **{data['name']}** 님의 발쫀잼 내부 티어 `{INTERNAL_TIER_LABELS[티어.value]}` 설정을 완료했어요. "
-        f"(밸런스 점수: `{INTERNAL_TIER_SCORES[티어.value]:g}점`)",
-        ephemeral=True,
-    )
-
-
-@set_internal_tier.error
-async def set_internal_tier_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
+    await update_internal_tier(interaction, 대상, internal_tier)
 
 
 @bot.tree.command(name="내부티어초기화", description="(어드민) 멤버의 발쫀잼 내부 티어를 미분류로 초기화합니다")
@@ -695,6 +675,12 @@ async def set_internal_tier_error(interaction: discord.Interaction, error):
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def clear_internal_tier(interaction: discord.Interaction, 대상: discord.Member):
+    # /내부티어설정에서 미분류를 고른 것과 같은 동작
+    await update_internal_tier(interaction, 대상, None)
+
+
+# 내부 티어 저장 공통 — internal_tier가 None이면 미분류(DB null)
+async def update_internal_tier(interaction, 대상, internal_tier):
     if await block_if_not_in_guild(interaction):
         return
     if await block_if_bot_target(interaction, 대상):
@@ -706,26 +692,29 @@ async def clear_internal_tier(interaction: discord.Interaction, 대상: discord.
     data = snapshot.to_dict() if snapshot.exists else {}
     if not data.get("name"):
         await interaction.followup.send(
-            f"❌ **{대상.display_name}** 님의 기본설정 정보가 없어요.",
+            f"❌ **{escape_display_text(대상.display_name)}** 님의 기본설정 정보가 없어요. "
+            "`/기본설정`을 먼저 진행해주세요.",
             ephemeral=True,
         )
         return
 
     await asyncio.to_thread(
         user_ref.set,
-        {"internal_tier": None, "updated_at": firestore.SERVER_TIMESTAMP},
+        {"internal_tier": internal_tier, "updated_at": firestore.SERVER_TIMESTAMP},
         merge=True,
     )
+    name = escape_display_text(data["name"])
+    if internal_tier is None:
+        await interaction.followup.send(
+            f"✅ **{name}** 님의 발쫀잼 내부 티어를 `미분류`로 설정했어요.",
+            ephemeral=True,
+        )
+        return
     await interaction.followup.send(
-        f"✅ **{data['name']}** 님의 발쫀잼 내부 티어를 `미분류`로 초기화했어요.",
+        f"✅ **{name}** 님의 발쫀잼 내부 티어 `{INTERNAL_TIER_LABELS[internal_tier]}` 설정을 완료했어요. "
+        f"(밸런스 점수: `{INTERNAL_TIER_SCORES[internal_tier]:g}점`)",
         ephemeral=True,
     )
-
-
-@clear_internal_tier.error
-async def clear_internal_tier_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
 # ===== /기본설정 =====
@@ -871,8 +860,7 @@ async def change_nickname(interaction: discord.Interaction):
     if await block_if_unverified(interaction):
         return
     # 기존에 저장된 정보가 있으면 모달에 미리 채워줌
-    doc = db.collection("users").document(str(interaction.user.id)).get()
-    data = doc.to_dict() if doc.exists else {}
+    data = await asyncio.to_thread(get_user_data, interaction.user.id)
     await interaction.response.send_modal(NicknameModal(
         interaction.user,
         data.get("student_id", ""),
@@ -894,11 +882,6 @@ async def admin_basic_setup(interaction: discord.Interaction, 대상: discord.Me
         return
     await interaction.response.send_modal(BasicSetupModal(대상))
 
-@admin_basic_setup.error
-async def admin_basic_setup_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
 
 @bot.tree.command(name="대리역할설정", description="(어드민) 다른 멤버의 역할군·티어를 대신 설정합니다")
 @app_commands.describe(대상="설정해줄 멤버")
@@ -913,11 +896,6 @@ async def admin_set_role(interaction: discord.Interaction, 대상: discord.Membe
         ephemeral=True
     )
 
-@admin_set_role.error
-async def admin_set_role_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
 
 @bot.tree.command(name="대리닉네임변경", description="(어드민) 다른 멤버의 닉네임을 '학번 이름 / 발로닉' 형식으로 변경합니다")
 @app_commands.describe(대상="닉네임을 바꿔줄 멤버")
@@ -927,19 +905,13 @@ async def admin_change_nickname(interaction: discord.Interaction, 대상: discor
     if await block_if_bot_target(interaction, 대상):
         return
     # 대상에게 저장된 정보가 있으면 모달에 미리 채워줌
-    doc = db.collection("users").document(str(대상.id)).get()
-    data = doc.to_dict() if doc.exists else {}
+    data = await asyncio.to_thread(get_user_data, 대상.id)
     await interaction.response.send_modal(NicknameModal(
         대상,
         data.get("student_id", ""),
         data.get("name", ""),
         data.get("riot_id", ""),
     ))
-
-@admin_change_nickname.error
-async def admin_change_nickname_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
 # ===== 파티 모집 =====
@@ -959,7 +931,8 @@ def as_utc(value):
     return value.astimezone(timezone.utc)
 
 
-def parse_party_time(value):
+# 한국 시간 "YYYY-MM-DD HH:MM" → UTC (최소 10분 이후 ~ max_lead 이내)
+def parse_start_time(value, max_lead, too_late_message):
     try:
         local_time = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=PARTY_TIMEZONE)
     except ValueError:
@@ -968,23 +941,17 @@ def parse_party_time(value):
     now_local = datetime.now(PARTY_TIMEZONE)
     if local_time < now_local + PARTY_MIN_LEAD:
         return None, "❌ 시작시간은 현재 시각보다 최소 10분 이후여야 해요."
-    if local_time > now_local + PARTY_MAX_LEAD:
-        return None, "❌ 시작시간은 현재부터 24시간 이내로 정해주세요."
+    if local_time > now_local + max_lead:
+        return None, too_late_message
     return local_time.astimezone(timezone.utc), None
+
+
+def parse_party_time(value):
+    return parse_start_time(value, PARTY_MAX_LEAD, "❌ 시작시간은 현재부터 24시간 이내로 정해주세요.")
 
 
 def parse_event_time(value):
-    try:
-        local_time = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=PARTY_TIMEZONE)
-    except ValueError:
-        return None, "❌ 선택한 날짜 또는 시간이 올바르지 않아요. 다시 선택해주세요."
-
-    now_local = datetime.now(PARTY_TIMEZONE)
-    if local_time < now_local + PARTY_MIN_LEAD:
-        return None, "❌ 시작시간은 현재 시각보다 최소 10분 이후여야 해요."
-    if local_time > now_local + EVENT_MAX_LEAD:
-        return None, "❌ 이벤트는 현재부터 14일 이내로 정해주세요."
-    return local_time.astimezone(timezone.utc), None
+    return parse_start_time(value, EVENT_MAX_LEAD, "❌ 이벤트는 현재부터 14일 이내로 정해주세요.")
 
 
 def party_max_members(data):
@@ -1015,6 +982,12 @@ def party_status(data, now=None):
     if len(data.get("member_ids", [])) >= party_max_members(data):
         return "full"
     return "open"
+
+
+# 사용자가 입력한 파티·이벤트 이름 등을 표시할 때 마크다운·멘션을 무력화
+def escape_display_text(value):
+    text = str(value or "").strip()
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
 
 
 async def get_party_member_names(guild, user_ids):
@@ -1060,6 +1033,58 @@ async def try_edit_recruitment_message(message, embed, view, kind, recruitment_i
         return False
 
 
+# 모집글과 DB(원본·공개 미러)를 함께 삭제하고 결과 안내 문구를 반환
+async def delete_recruitment(message, kind, recruitment_id, lock):
+    collection = PARTY_COLLECTION if kind == "party" else EVENT_COLLECTION
+    label = "파티" if kind == "party" else "발쫀전"
+    try:
+        async with lock:
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
+            await asyncio.to_thread(
+                delete_recruitment_pair,
+                db.collection(collection).document(recruitment_id),
+                kind,
+                recruitment_id,
+            )
+        return f"🗑️ {label} 모집글을 삭제했어요."
+    except Exception:
+        log.exception("%s 삭제 실패 — id=%s", label, recruitment_id)
+        return f"❌ {label} 삭제 중 오류가 발생했어요."
+
+
+class DeleteConfirmView(discord.ui.View):
+    """삭제 버튼을 잘못 눌러도 바로 지워지지 않도록 실행자에게만 한 번 더 확인."""
+
+    def __init__(self, owner_id, message, kind, recruitment_id, lock):
+        super().__init__(timeout=60)
+        self.owner_id = str(owner_id)
+        self.message = message
+        self.kind = kind
+        self.recruitment_id = str(recruitment_id)
+        self.lock = lock
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message("❌ 삭제를 요청한 사람만 확인할 수 있어요.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="삭제", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="⏳ 삭제하는 중...", view=None)
+        result = await delete_recruitment(self.message, self.kind, self.recruitment_id, self.lock)
+        await interaction.edit_original_response(content=result)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="삭제를 취소했어요.", view=None)
+
+
 async def build_party_embed(data, guild):
     status = party_status(data)
     max_members = party_max_members(data)
@@ -1101,7 +1126,7 @@ async def build_party_embed(data, guild):
     delete_timestamp = int(delete_at.timestamp())
 
     embed = discord.Embed(
-        title=f"🎮 {party_type_name(max_members)} · {data['name']}",
+        title=f"🎮 {party_type_name(max_members)} · {escape_display_text(data['name'])}",
         description="\n".join(member_lines),
         color=color,
     )
@@ -1191,7 +1216,7 @@ class PartyView(discord.ui.View):
                 "missing": "❌ 이미 삭제된 파티예요.",
                 "closed": "❌ 모집이 마감된 파티예요.",
                 "already_member": "ℹ️ 이미 참가가 확정된 파티예요.",
-                "already_waitlist": "ℹ️ 이미 이 파티의 대기 명단에 있어요.",
+                "already_waitlist": f"ℹ️ 이미 이 파티의 대기 명단 {waitlist_position}번에 있어요.",
                 "joined": "✅ 파티 참가가 확정됐어요!",
                 "waitlisted": f"🕒 대기 명단 {waitlist_position}번으로 등록됐어요. 빈자리가 생기면 자동으로 참가가 확정됩니다.",
             }
@@ -1348,7 +1373,6 @@ class PartyView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         party_id = str(interaction.message.id)
-        party_ref = db.collection(PARTY_COLLECTION).document(party_id)
 
         try:
             data = await asyncio.to_thread(get_party_data, party_id)
@@ -1364,17 +1388,16 @@ class PartyView(discord.ui.View):
                 )
                 return
 
-            async with party_action_lock:
-                try:
-                    await interaction.message.delete()
-                except discord.NotFound:
-                    pass
-                await asyncio.to_thread(
-                    delete_recruitment_pair, party_ref, "party", party_id
-                )
-            await interaction.followup.send("🗑️ 파티 모집글을 삭제했어요.", ephemeral=True)
+            await interaction.followup.send(
+                f"🗑️ **{escape_display_text(data.get('name'))}** 파티 모집글을 삭제할까요?\n"
+                "참가자·대기 명단도 함께 삭제되며 되돌릴 수 없어요.",
+                view=DeleteConfirmView(
+                    interaction.user.id, interaction.message, "party", party_id, party_action_lock
+                ),
+                ephemeral=True,
+            )
         except Exception:
-            log.exception("파티 삭제 실패 — party=%s", party_id)
+            log.exception("파티 삭제 확인 화면 열기 실패 — party=%s", party_id)
             await interaction.followup.send("❌ 파티 삭제 중 오류가 발생했어요.", ephemeral=True)
 
 
@@ -1532,8 +1555,18 @@ def get_party_channel_id(guild_id):
     return snapshot.to_dict().get("party_channel_id")
 
 
-@bot.tree.command(name="파티채널설정", description="(어드민) 파티 모집 명령어를 사용할 채널을 지정합니다")
-@app_commands.describe(채널="파티 모집 전용 채널")
+# 모집글이 올라간 적 있는 채널 — 메시지 삭제 이벤트에서 이 채널만 DB를 확인 (실행 중 메모리에만 유지)
+recruitment_channel_ids = set()
+recruitment_channel_loaded_guilds = set()
+
+
+def remember_recruitment_channel(channel_id):
+    if channel_id:
+        recruitment_channel_ids.add(str(channel_id))
+
+
+@bot.tree.command(name="파티채널설정", description="(어드민) 파티·발쫀전 모집 명령어를 사용할 채널을 지정합니다")
+@app_commands.describe(채널="파티·발쫀전 모집 전용 채널")
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def configure_party_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
@@ -1565,17 +1598,12 @@ async def configure_party_channel(interaction: discord.Interaction, 채널: disc
         },
         merge=True,
     )
+    remember_recruitment_channel(채널.id)
     await interaction.followup.send(
-        f"✅ 파티 모집 채널을 {채널.mention}(으)로 설정했어요.\n"
-        "이제 `/파티생성`은 이 채널에서만 사용할 수 있습니다.",
+        f"✅ 모집 채널을 {채널.mention}(으)로 설정했어요.\n"
+        "이제 `/파티생성`과 `/이벤트생성`은 이 채널에서만 사용할 수 있습니다.",
         ephemeral=True,
     )
-
-
-@configure_party_channel.error
-async def configure_party_channel_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
 
 
 def make_party_date_options():
@@ -1742,7 +1770,7 @@ class PartyCreationView(discord.ui.View):
             tier_note = "희망 티어대는 참가 제한이 아닌 모집 안내로만 표시됩니다.\n"
 
         return (
-            f"🎮 **{party_type_name(self.max_members)} · {self.name}**의 시작 시간을 선택해주세요.\n"
+            f"🎮 **{party_type_name(self.max_members)} · {escape_display_text(self.name)}**의 시작 시간을 선택해주세요.\n"
             f"{tier_text}"
             f"• 날짜: **{date_text}**\n"
             f"• 시간: **{time_text}**\n\n"
@@ -1848,7 +1876,7 @@ class PartyTimeEditView(discord.ui.View):
         target = datetime.strptime(self.selected_date, "%Y-%m-%d")
         date_text = f"{target.month}월 {target.day}일"
         return (
-            f"⏰ **{self.name}** 파티의 시작 시간을 변경합니다.\n"
+            f"⏰ **{escape_display_text(self.name)}** 파티의 시작 시간을 변경합니다.\n"
             f"• 현재: <t:{self.current_timestamp}:F>\n"
             f"• 변경: **{date_text} {self.selected_hour}:{self.selected_minute}**\n\n"
             "날짜·시간을 확인한 뒤 `시간 변경`을 눌러주세요. "
@@ -2038,6 +2066,7 @@ async def publish_party(
 
             embed = await build_party_embed(data, interaction.guild)
             message = await channel.send(embed=embed)
+            remember_recruitment_channel(channel.id)
             data["message_id"] = str(message.id)
             party_ref = db.collection(PARTY_COLLECTION).document(str(message.id))
             try:
@@ -2122,7 +2151,7 @@ async def create_party(
 
     view = PartyTypeSelectionView(interaction.user.id, name, channel)
     await interaction.followup.send(
-        f"🎮 **{name}** 파티의 모집 유형을 선택해주세요.",
+        f"🎮 **{escape_display_text(name)}** 파티의 모집 유형을 선택해주세요.",
         view=view,
         ephemeral=True,
     )
@@ -2218,7 +2247,7 @@ def event_tier_join_error(restriction, user_data):
         return (
             "❌ 이 이벤트의 참가 티어 범위에 해당하지 않아요.\n"
             f"{event_tier_restriction_text(restriction)}\n"
-            f"내 등록 티어: **{escape_event_text(tier_label)}**"
+            f"내 등록 티어: **{escape_display_text(tier_label)}**"
         )
     return None
 
@@ -2340,11 +2369,6 @@ def event_member_lines(member_ids, names, limit):
     return lines
 
 
-def escape_event_text(value):
-    text = str(value or "").strip()
-    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
-
-
 async def build_event_embed(data, guild):
     status = event_status(data)
     status_text = "🟢 모집 중" if status == "open" else "🔴 모집 마감"
@@ -2358,12 +2382,12 @@ async def build_event_embed(data, guild):
     scheduled_at = as_utc(data["scheduled_at"])
     scheduled_timestamp = int(scheduled_at.timestamp())
 
-    rules = escape_event_text(data.get("rules")) or "상세 안내는 운영진 공지를 확인해주세요."
-    prize = escape_event_text(data.get("prize"))
+    rules = escape_display_text(data.get("rules")) or "상세 안내는 운영진 공지를 확인해주세요."
+    prize = escape_display_text(data.get("prize"))
     member_count = len(member_ids)
 
     embed = discord.Embed(
-        title=f"🏆 발쫀전 · {escape_event_text(data['name'])}",
+        title=f"🏆 발쫀전 · {escape_display_text(data['name'])}",
         description=rules,
         color=color,
     )
@@ -2388,9 +2412,9 @@ async def build_event_embed(data, guild):
     embed.add_field(name="🎁 상품", value=prize, inline=False)
 
     if data.get("has_entry_fee"):
-        entry_fee = escape_event_text(data.get("entry_fee"))
-        bank_holder = escape_event_text(data.get("bank_holder"))
-        account_number = escape_event_text(data.get("account_number"))
+        entry_fee = escape_display_text(data.get("entry_fee"))
+        bank_holder = escape_display_text(data.get("bank_holder"))
+        account_number = escape_display_text(data.get("account_number"))
         fee_text = (
             "☑️ **있음**　☐ 없음\n"
             f"금액: **{entry_fee}**\n"
@@ -2487,13 +2511,14 @@ def join_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
 
 
 @transactional
-def leave_event_transaction(transaction, event_ref, mirror_ref, user_id, now):
+def leave_event_transaction(transaction, event_ref, mirror_ref, user_id, now, ignore_closed=False):
+    # ignore_closed: 관리자의 참가자 제외는 모집 마감·시작 후에도 허용
     snapshot = event_ref.get(transaction=transaction)
     if not snapshot.exists:
         return "missing", None
 
     data = snapshot.to_dict()
-    if event_status(data, now) == "closed":
+    if not ignore_closed and event_status(data, now) == "closed":
         return "closed", data
 
     member_ids = [str(member_id) for member_id in data.get("member_ids", [])]
@@ -2685,7 +2710,7 @@ class EventView(discord.ui.View):
                 lines += [f"{index}. {names[member_id]}" for index, member_id in enumerate(waitlist_ids, 1)]
             await send_ephemeral_log(
                 interaction,
-                f"🏆 **{escape_event_text(data['name'])} 참가자 · {len(member_ids)}명**",
+                f"🏆 **{escape_display_text(data['name'])} 참가자 · {len(member_ids)}명**",
                 lines,
             )
         except Exception:
@@ -2769,20 +2794,109 @@ class EventView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         event_id = str(interaction.message.id)
-        event_ref = db.collection(EVENT_COLLECTION).document(event_id)
+        try:
+            data = await asyncio.to_thread(get_event_data, event_id)
+            if data is None:
+                await interaction.followup.send("❌ 이미 삭제된 이벤트예요.", ephemeral=True)
+                return
+            await interaction.followup.send(
+                f"🗑️ **발쫀전 · {escape_display_text(data.get('name'))}** 모집글을 삭제할까요?\n"
+                f"참가 신청 {len(data.get('member_ids', []))}명의 명단도 함께 삭제되며 되돌릴 수 없어요.",
+                view=DeleteConfirmView(
+                    interaction.user.id, interaction.message, "event", event_id, event_action_lock
+                ),
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception("이벤트 삭제 확인 화면 열기 실패 — event=%s", event_id)
+            await interaction.followup.send("❌ 이벤트 삭제 중 오류가 발생했어요.", ephemeral=True)
+
+    @discord.ui.button(
+        label="참가자 제외",
+        style=discord.ButtonStyle.secondary,
+        custom_id="event:remove_member",
+        row=1,
+    )
+    async def remove_event_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await block_if_not_in_guild(interaction):
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 참가자를 제외할 수 있어요.", ephemeral=True)
+            return
+        view = EventMemberRemoveView(interaction.user.id, interaction.message)
+        await interaction.response.send_message(view.render_content(), view=view, ephemeral=True)
+
+
+class EventMemberRemoveView(discord.ui.View):
+    """관리자가 노쇼 등으로 참가자를 명단에서 빼는 화면 — 모집 마감 후에도 사용 가능."""
+
+    def __init__(self, owner_id, event_message):
+        super().__init__(timeout=120)
+        self.owner_id = str(owner_id)
+        self.event_message = event_message
+        self.target = None
+        self.remove.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if str(interaction.user.id) == self.owner_id:
+            return True
+        await interaction.response.send_message("❌ 이 화면을 연 관리자만 사용할 수 있어요.", ephemeral=True)
+        return False
+
+    def render_content(self):
+        if self.target is None:
+            return "👤 명단에서 제외할 참가자를 선택해주세요.\n제외된 자리는 다음 신청자가 신청 순서대로 채웁니다."
+        return (
+            f"👤 **{escape_display_text(self.target.display_name)}** 님을 이 발쫀전 명단에서 제외할까요?\n"
+            "제외된 자리는 다음 신청자가 신청 순서대로 채우며, 본인에게 따로 알림은 가지 않아요."
+        )
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="제외할 참가자 선택", row=0)
+    async def select_target(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        self.target = select.values[0]
+        self.remove.disabled = False
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    @discord.ui.button(label="제외", style=discord.ButtonStyle.danger, row=1)
+    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="⏳ 제외하는 중...", view=None)
+        event_id = str(self.event_message.id)
+        user_id = str(self.target.id)
         try:
             async with event_action_lock:
-                try:
-                    await interaction.message.delete()
-                except discord.NotFound:
-                    pass
-                await asyncio.to_thread(
-                    delete_recruitment_pair, event_ref, "event", event_id
+                result, data = await asyncio.to_thread(
+                    leave_event_transaction,
+                    db.transaction(),
+                    db.collection(EVENT_COLLECTION).document(event_id),
+                    get_toolkit_recruitment_ref("event", event_id),
+                    user_id,
+                    utc_now(),
+                    ignore_closed=True,
                 )
-            await interaction.followup.send("🗑️ 발쫀전 모집글을 삭제했어요.", ephemeral=True)
+            name = escape_display_text(self.target.display_name)
+            messages = {
+                "missing": "❌ 이미 삭제된 이벤트예요.",
+                "not_member": f"ℹ️ **{name}** 님은 이 이벤트에 참가하고 있지 않아요.",
+                "left": f"✅ **{name}** 님을 명단에서 제외했어요.",
+            }
+            refresh_warning = ""
+            if result == "left":
+                embed = await build_event_embed(data, self.event_message.guild)
+                refreshed = await try_edit_recruitment_message(
+                    self.event_message, embed, EventView(data), "이벤트", event_id
+                )
+                if not refreshed:
+                    refresh_warning = "\n⚠️ 제외는 저장됐지만 모집글 표시 갱신이 지연되고 있어요."
+            await interaction.edit_original_response(content=messages[result] + refresh_warning)
         except Exception:
-            log.exception("이벤트 삭제 실패 — event=%s", event_id)
-            await interaction.followup.send("❌ 이벤트 삭제 중 오류가 발생했어요.", ephemeral=True)
+            log.exception("이벤트 참가자 제외 실패 — event=%s user=%s", event_id, user_id)
+            await interaction.edit_original_response(content="❌ 참가자 제외 중 오류가 발생했어요.")
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="참가자 제외를 취소했어요.", view=None)
 
 
 class EventTierSelect(PartyCreationSelect):
@@ -2842,7 +2956,7 @@ class EventFeeSelectionView(discord.ui.View):
             if error else event_tier_restriction_text(restriction)
         )
         return (
-            f"🏆 **발쫀전 · {escape_event_text(self.name)}** 생성\n"
+            f"🏆 **발쫀전 · {escape_display_text(self.name)}** 생성\n"
             f"🎯 참가 조건: {condition}\n\n"
             "참가 조건을 확인한 뒤 아래에서 참가비 여부를 선택해주세요.\n"
             "참가비가 있으면 입력한 은행·예금주·계좌번호가 모집글에 공개됩니다."
@@ -3020,8 +3134,8 @@ class EventCreationView(discord.ui.View):
             else "☐ 있음　☑️ 없음"
         )
         return (
-            f"🏆 **발쫀전 · {escape_event_text(self.name)}** 생성\n"
-            f"• 상품: **{escape_event_text(self.details['prize'])}**\n"
+            f"🏆 **발쫀전 · {escape_display_text(self.name)}** 생성\n"
+            f"• 상품: **{escape_display_text(self.details['prize'])}**\n"
             f"• 참가비: **{fee_text}**\n"
             f"• 참가 조건: {event_tier_restriction_text(self.details.get('tier_restriction'))}\n"
             f"• 날짜: **{date_text}**\n"
@@ -3108,6 +3222,7 @@ async def publish_event(interaction, channel, name, scheduled_at, details):
             }
             embed = await build_event_embed(data, interaction.guild)
             message = await channel.send(embed=embed)
+            remember_recruitment_channel(channel.id)
             data["message_id"] = str(message.id)
             event_ref = db.collection(EVENT_COLLECTION).document(str(message.id))
             try:
@@ -3193,12 +3308,6 @@ async def create_event(
     )
 
 
-@create_event.error
-async def create_event_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ 어드민만 사용 가능한 명령어입니다!", ephemeral=True)
-
-
 def backfill_toolkit_recruitments_sync():
     now = utc_now()
     batch = db.batch()
@@ -3262,19 +3371,39 @@ async def delete_recruitment_documents(message_id):
         log.exception("삭제된 모집글 DB 정리 실패 — message=%s", message_id)
 
 
+async def is_recruitment_channel(guild_id, channel_id):
+    """모집글이 있을 수 있는 채널인지 — 서버마다 설정 채널을 한 번만 읽어 캐시."""
+    if guild_id is None:
+        return False
+    guild_key = str(guild_id)
+    if guild_key not in recruitment_channel_loaded_guilds:
+        try:
+            configured = await asyncio.to_thread(get_party_channel_id, guild_key)
+        except Exception:
+            log.exception("모집 채널 설정 조회 실패 — guild=%s", guild_key)
+            return True  # 확인하지 못하면 놓치지 않도록 DB를 확인
+        remember_recruitment_channel(configured)
+        recruitment_channel_loaded_guilds.add(guild_key)
+    return str(channel_id) in recruitment_channel_ids
+
+
 @bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     # 관리자 등이 모집글을 직접 삭제한 경우 남은 DB 데이터도 함께 정리
-    await delete_recruitment_documents(payload.message_id)
+    # 모든 채널의 삭제마다 DB를 읽지 않도록 모집 채널의 삭제만 확인
+    if await is_recruitment_channel(payload.guild_id, payload.channel_id):
+        await delete_recruitment_documents(payload.message_id)
 
 
 @bot.event
 async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    if not await is_recruitment_channel(payload.guild_id, payload.channel_id):
+        return
     for message_id in payload.message_ids:
         await delete_recruitment_documents(message_id)
 
 
-async def get_party_message(data):
+async def get_recruitment_message(data):
     guild = bot.get_guild(int(data["guild_id"]))
     if guild is None:
         return None, "guild_missing"
@@ -3296,28 +3425,22 @@ async def refresh_party_messages():
 
     for party_id, data in parties:
         try:
-            message, _ = await get_party_message(data)
-            if message is None:
-                continue
-            embed = await build_party_embed(data, message.guild)
-            await message.edit(embed=embed, view=PartyView(data))
+            remember_recruitment_channel(data.get("channel_id"))
+            message, reason = await get_recruitment_message(data)
+            if message is not None:
+                embed = await build_party_embed(data, message.guild)
+                await message.edit(embed=embed, view=PartyView(data))
+            elif reason in {"channel_missing", "message_missing"}:
+                await asyncio.to_thread(
+                    delete_recruitment_pair,
+                    db.collection(PARTY_COLLECTION).document(party_id),
+                    "party",
+                    party_id,
+                )
         except discord.Forbidden:
             log.error("기존 파티 모집글 갱신 권한 없음 — party=%s", party_id)
         except Exception:
             log.exception("기존 파티 모집글 갱신 실패 — party=%s", party_id)
-
-
-async def get_event_message(data):
-    guild = bot.get_guild(int(data["guild_id"]))
-    if guild is None:
-        return None, "guild_missing"
-    channel = guild.get_channel(int(data["channel_id"]))
-    if channel is None:
-        return None, "channel_missing"
-    try:
-        return await channel.fetch_message(int(data["message_id"])), None
-    except discord.NotFound:
-        return None, "message_missing"
 
 
 async def refresh_event_messages():
@@ -3329,7 +3452,8 @@ async def refresh_event_messages():
 
     for event_id, data in events:
         try:
-            message, reason = await get_event_message(data)
+            remember_recruitment_channel(data.get("channel_id"))
+            message, reason = await get_recruitment_message(data)
             if message is not None:
                 embed = await build_event_embed(data, message.guild)
                 await message.edit(embed=embed, view=EventView(data))
@@ -3365,7 +3489,7 @@ async def cleanup_parties():
             party_ref = db.collection(PARTY_COLLECTION).document(party_id)
 
             if now >= delete_at:
-                message, reason = await get_party_message(data)
+                message, reason = await get_recruitment_message(data)
                 if message is not None:
                     await message.delete()
                 if reason != "guild_missing":
@@ -3386,7 +3510,7 @@ async def cleanup_parties():
                     party_id,
                     data,
                 )
-                message, reason = await get_party_message(data)
+                message, reason = await get_recruitment_message(data)
                 if message is not None:
                     embed = await build_party_embed(data, message.guild)
                     await message.edit(embed=embed, view=PartyView(data))
@@ -3432,7 +3556,7 @@ async def close_started_events():
                 data,
             )
 
-            message, reason = await get_event_message(data)
+            message, reason = await get_recruitment_message(data)
             if message is not None:
                 embed = await build_event_embed(data, message.guild)
                 await message.edit(embed=embed, view=EventView(data))
