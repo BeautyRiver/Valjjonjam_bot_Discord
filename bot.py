@@ -523,6 +523,22 @@ EMBED_TITLE_LIMIT = 256
 EMBED_DESCRIPTION_LIMIT = 4096
 
 
+# 입력한 내용을 임베드로 변환 — (임베드, None) 또는 글자 수 초과 시 (None, 안내 문구) 반환
+def build_notice_embed(내용, 제목=None):
+    # 슬래시 입력은 줄바꿈을 못 넣으니 \n 표기를 실제 줄바꿈으로 변환
+    description = 내용.replace("\\n", "\n")
+    if len(description) > EMBED_DESCRIPTION_LIMIT or len(제목 or "") > EMBED_TITLE_LIMIT:
+        return None, (
+            f"❌ 제목은 {EMBED_TITLE_LIMIT}자, 내용은 {EMBED_DESCRIPTION_LIMIT:,}자까지 보낼 수 있어요. "
+            f"(현재 제목 {len(제목 or '')}자 · 내용 {len(description):,}자)"
+        )
+
+    embed = discord.Embed(description=description, color=discord.Color.blurple())
+    if 제목:
+        embed.title = 제목
+    return embed, None
+
+
 # 채널에 임베드를 보내는 데 필요한데 봇에게 없는 권한 이름 목록 (스레드는 스레드 전송 권한 확인)
 def missing_send_permissions(permissions, in_thread=False):
     required = [
@@ -544,19 +560,10 @@ def missing_send_permissions(permissions, in_thread=False):
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = None, 미리보기: bool = False):
-    # 슬래시 입력은 줄바꿈을 못 넣으니 \n 표기를 실제 줄바꿈으로 변환
-    description = 내용.replace("\\n", "\n")
-    if len(description) > EMBED_DESCRIPTION_LIMIT or len(제목 or "") > EMBED_TITLE_LIMIT:
-        await interaction.response.send_message(
-            f"❌ 제목은 {EMBED_TITLE_LIMIT}자, 내용은 {EMBED_DESCRIPTION_LIMIT:,}자까지 보낼 수 있어요. "
-            f"(현재 제목 {len(제목 or '')}자 · 내용 {len(description):,}자)",
-            ephemeral=True,
-        )
+    embed, error = build_notice_embed(내용, 제목)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
-
-    embed = discord.Embed(description=description, color=discord.Color.blurple())
-    if 제목:
-        embed.title = 제목
 
     # 미리보기(디버그): 채널에 안 보내고 나에게만 보여줌
     if 미리보기:
@@ -591,6 +598,91 @@ async def bot_say(interaction: discord.Interaction, 내용: str, 제목: str = N
         )
         return
     await interaction.followup.send("✅ 메세지를 보냈어요!", ephemeral=True)
+
+
+# 짧은 시간에 DM을 몰아 보내면 Discord 스팸 제한에 걸릴 수 있어 한 명씩 간격을 둠 (초)
+DM_BROADCAST_INTERVAL = 1
+dm_broadcast_lock = asyncio.Lock()
+
+
+def dm_broadcast_recipients(guild):
+    return [member for member in guild.members if not member.bot]
+
+
+async def send_dm_broadcast(guild, embed):
+    sent, failed = 0, 0
+    for member in dm_broadcast_recipients(guild):
+        try:
+            await member.send(embed=embed)
+            sent += 1
+        except discord.HTTPException as e:
+            # DM 차단 또는 일시적인 전송 실패 — 나머지 멤버에게는 계속 보냄
+            failed += 1
+            log.warning("전체 안내 DM 실패 — user=%s status=%s", member.id, e.status)
+        await asyncio.sleep(DM_BROADCAST_INTERVAL)
+    return sent, failed
+
+
+class DmBroadcastConfirmView(discord.ui.View):
+    """보내면 되돌릴 수 없는 전체 DM을 실행자에게 한 번 더 확인."""
+
+    def __init__(self, guild, embed):
+        super().__init__(timeout=60)
+        self.guild = guild
+        self.embed = embed
+
+    @discord.ui.button(label="전송", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        # 관리자 두 명이 동시에 확인해 같은 사람에게 DM이 겹쳐 가지 않게 함
+        if dm_broadcast_lock.locked():
+            await interaction.response.edit_message(
+                content="⚠️ 이미 다른 전체 안내를 보내는 중이에요. 끝난 뒤 다시 시도해주세요.", view=None
+            )
+            return
+        async with dm_broadcast_lock:
+            await interaction.response.edit_message(content="⏳ DM을 보내는 중...", view=None)
+            sent, failed = await send_dm_broadcast(self.guild, self.embed)
+        await interaction.edit_original_response(
+            content=f"📣 전체 안내 DM 전송 완료!\n✅ 보냄: {sent}명 | ❌ 전송 실패(DM 차단 등): {failed}명"
+        )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="전체 안내를 취소했어요.", view=None)
+
+
+@bot.tree.command(name="전체안내", description="봇을 제외한 서버 멤버 전원에게 입력한 내용을 DM으로 보냅니다")
+@app_commands.describe(
+    내용="보낼 내용 (줄바꿈은 \\n 으로 입력)",
+    제목="임베드 제목 (선택)",
+    미리보기="True면 나에게만 보여요 (전송 전 확인용)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def dm_broadcast(interaction: discord.Interaction, 내용: str, 제목: str = None, 미리보기: bool = False):
+    embed, error = build_notice_embed(내용, 제목)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    # DM에서는 어느 서버의 공지인지 알 수 없으니 서버 이름을 표시
+    guild = interaction.guild
+    embed.set_footer(text=f"{guild.name} 공지")
+    count = len(dm_broadcast_recipients(guild))
+
+    if 미리보기:
+        await interaction.response.send_message(
+            content=f"🧪 **미리보기** — 아직 아무에게도 전송되지 않았어요! (받는 사람 {count}명)",
+            embed=embed, ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        content=f"📨 봇을 제외한 멤버 **{count}명**에게 아래 내용을 DM으로 보낼까요?\n보낸 DM은 되돌릴 수 없어요.",
+        embed=embed, view=DmBroadcastConfirmView(guild, embed), ephemeral=True
+    )
 
 
 @bot.tree.command(name="미인증안내", description="인증됨 역할이 없는 멤버 전원에게 기본설정 안내 DM을 보냅니다")

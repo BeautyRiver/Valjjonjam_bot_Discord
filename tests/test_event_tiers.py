@@ -28,10 +28,11 @@ CONSTANTS = {
     "DB_SAVE_FAILED_NOTICE", "recruitment_channel_ids", "recruitment_channel_loaded_guilds",
     "PARTY_COLLECTION", "PARTY_MAX_MEMBERS", "INHOUSE_PARTY_MAX_MEMBERS", "SUPPORTED_PARTY_SIZES",
     "PARTY_DELETE_DELAY", "PARTY_PUBLIC_WAITLIST_LIMIT", "PARTY_PREFERRED_TIER_LABELS",
-    "EMBED_TITLE_LIMIT", "EMBED_DESCRIPTION_LIMIT",
+    "EMBED_TITLE_LIMIT", "EMBED_DESCRIPTION_LIMIT", "DM_BROADCAST_INTERVAL",
 }
 DEFINITIONS = {
-    "missing_send_permissions", "bot_say",
+    "build_notice_embed", "missing_send_permissions", "bot_say",
+    "dm_broadcast_recipients", "send_dm_broadcast", "DmBroadcastConfirmView", "dm_broadcast",
     "remember_recruitment_channel", "is_recruitment_channel", "on_app_command_error",
     "block_if_bot_target", "update_internal_tier",
     "party_max_members", "party_type_name", "party_preferred_tier_name", "party_status",
@@ -815,6 +816,84 @@ class BotSayTests(unittest.IsolatedAsyncioTestCase):
         permissions = discord.Permissions(view_channel=True, send_messages=True, embed_links=True)
         self.assertEqual(ns["missing_send_permissions"](permissions), [])
         self.assertEqual(ns["missing_send_permissions"](permissions, in_thread=True), ["스레드에서 메시지 보내기"])
+
+
+class DmBroadcastTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.log = Mock()
+        self.lock = asyncio.Lock()
+        self.patch = patch.dict(ns, {
+            "log": self.log, "dm_broadcast_lock": self.lock, "DM_BROADCAST_INTERVAL": 0,
+        })
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.first = SimpleNamespace(id=1, bot=False, send=AsyncMock())
+        self.second = SimpleNamespace(id=2, bot=False, send=AsyncMock())
+        self.robot = SimpleNamespace(id=3, bot=True, send=AsyncMock())
+        self.guild = SimpleNamespace(id=100, name="발쫀잼", members=[self.first, self.robot, self.second])
+
+    def call(self):
+        call = interaction()
+        call.guild = self.guild
+        return call
+
+    def assert_nothing_sent(self):
+        for member in self.guild.members:
+            member.send.assert_not_awaited()
+
+    async def test_preview_only_shows_to_requester(self):
+        call = self.call()
+        await ns["dm_broadcast"](call, "첫 줄\\n둘째 줄", "공지", 미리보기=True)
+        kwargs = call.response.send_message.call_args.kwargs
+        self.assertIn("미리보기", kwargs["content"])
+        self.assertIn("2명", kwargs["content"])
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertNotIn("view", kwargs)
+        self.assertEqual(kwargs["embed"].description, "첫 줄\n둘째 줄")
+        self.assertEqual(kwargs["embed"].footer.text, "발쫀잼 공지")
+        self.assert_nothing_sent()
+
+    async def test_without_preview_asks_before_sending(self):
+        call = self.call()
+        await ns["dm_broadcast"](call, "공지 내용")
+        kwargs = call.response.send_message.call_args.kwargs
+        self.assertIn("2명", kwargs["content"])
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIsInstance(kwargs["view"], ns["DmBroadcastConfirmView"])
+        self.assert_nothing_sent()
+
+    async def test_too_long_is_rejected_without_confirm(self):
+        call = self.call()
+        await ns["dm_broadcast"](call, "가" * 4097)
+        self.assertIn("4,096자", call.response.send_message.call_args.args[0])
+        self.assertNotIn("view", call.response.send_message.call_args.kwargs)
+        self.assert_nothing_sent()
+
+    async def test_confirm_skips_bots_and_continues_after_dm_failure(self):
+        self.first.send.side_effect = http_error(discord.Forbidden, 403)
+        embed = discord.Embed(description="공지 내용")
+        call = self.call()
+        await ns["DmBroadcastConfirmView"](self.guild, embed).confirm.callback(call)
+        self.second.send.assert_awaited_once_with(embed=embed)
+        self.robot.send.assert_not_awaited()
+        result = call.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("보냄: 1명", result)
+        self.assertIn("실패(DM 차단 등): 1명", result)
+        self.log.warning.assert_called_once()
+        self.assertFalse(self.lock.locked())
+
+    async def test_cancel_sends_nothing(self):
+        call = self.call()
+        await ns["DmBroadcastConfirmView"](self.guild, discord.Embed()).cancel.callback(call)
+        self.assertIn("취소", call.response.edit_message.call_args.kwargs["content"])
+        self.assert_nothing_sent()
+
+    async def test_second_broadcast_is_refused_while_one_is_running(self):
+        call = self.call()
+        async with self.lock:
+            await ns["DmBroadcastConfirmView"](self.guild, discord.Embed()).confirm.callback(call)
+        self.assertIn("이미 다른 전체 안내", call.response.edit_message.call_args.kwargs["content"])
+        self.assert_nothing_sent()
 
 
 if __name__ == "__main__":
