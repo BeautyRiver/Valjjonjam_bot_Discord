@@ -8,7 +8,7 @@ interactions and Firestore reads/writes are local test doubles.
 import ast
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,10 +29,17 @@ CONSTANTS = {
     "PARTY_COLLECTION", "PARTY_MAX_MEMBERS", "INHOUSE_PARTY_MAX_MEMBERS", "SUPPORTED_PARTY_SIZES",
     "PARTY_DELETE_DELAY", "PARTY_PUBLIC_WAITLIST_LIMIT", "PARTY_PREFERRED_TIER_LABELS",
     "EMBED_TITLE_LIMIT", "EMBED_DESCRIPTION_LIMIT", "DM_BROADCAST_INTERVAL",
+    "GUILD_SETTINGS_COLLECTION", "PROFILE_CHECK_DEFAULT_DAYS", "PROFILE_CHECK_BUTTONS",
+    "PROFILE_CHECK_AUTO_TIME",
 }
 DEFINITIONS = {
     "build_notice_embed", "missing_send_permissions", "bot_say",
-    "dm_broadcast_recipients", "send_dm_broadcast", "DmBroadcastConfirmView", "dm_broadcast",
+    "dm_broadcast_recipients", "send_dm_broadcast", "DmSendConfirmView", "DmBroadcastConfirmView", "dm_broadcast",
+    "is_verified", "get_user_data", "send_split_lines", "send_ephemeral_log",
+    "list_registered_users", "get_guild_settings", "profile_check_due", "profile_check_targets",
+    "build_profile_check_embed", "ProfileCheckButton", "profile_check_view", "mark_profile_check_sent",
+    "send_profile_checks", "profile_check_summary", "ProfileCheckConfirmView", "profile_check_command",
+    "configure_profile_check", "report_profile_check_auto", "run_profile_check_auto",
     "remember_recruitment_channel", "is_recruitment_channel", "on_app_command_error",
     "block_if_bot_target", "update_internal_tier",
     "party_max_members", "party_type_name", "party_preferred_tier_name", "party_status",
@@ -68,7 +75,7 @@ for node in tree.body:
         node.decorator_list = []  # Firestore transaction wrapper is not needed by the local fake.
         nodes.append(node)
 ns = {
-    "discord": discord, "asyncio": asyncio, "datetime": datetime,
+    "discord": discord, "asyncio": asyncio, "datetime": datetime, "time": time,
     "timedelta": timedelta, "timezone": timezone, "log": logging.getLogger(__name__),
     "firestore": SimpleNamespace(SERVER_TIMESTAMP="SERVER_TIMESTAMP"),
     "app_commands": discord.app_commands,
@@ -892,8 +899,314 @@ class DmBroadcastTests(unittest.IsolatedAsyncioTestCase):
         call = self.call()
         async with self.lock:
             await ns["DmBroadcastConfirmView"](self.guild, discord.Embed()).confirm.callback(call)
-        self.assertIn("이미 다른 전체 안내", call.response.edit_message.call_args.kwargs["content"])
+        self.assertIn("이미 다른 일괄 DM", call.response.edit_message.call_args.kwargs["content"])
         self.assert_nothing_sent()
+
+
+class FakeProfileDatabase:
+    """users·guild_settings 읽기/병합 쓰기만 흉내 냄."""
+
+    def __init__(self):
+        self.documents = {}
+
+    def collection(self, name):
+        def document(doc_id):
+            path = f"{name}/{doc_id}"
+
+            def get():
+                data = deepcopy(self.documents.get(path))
+                return SimpleNamespace(exists=data is not None, to_dict=lambda: deepcopy(data))
+
+            def set_document(data, merge=False):
+                self.documents.setdefault(path, {}).update(deepcopy(data))
+
+            return SimpleNamespace(get=get, set=set_document)
+
+        def stream():
+            prefix = f"{name}/"
+            return [
+                SimpleNamespace(id=path[len(prefix):], to_dict=lambda data=data: deepcopy(data))
+                for path, data in self.documents.items() if path.startswith(prefix)
+            ]
+
+        return SimpleNamespace(document=document, stream=stream)
+
+
+class ProfileCheckTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.db = FakeProfileDatabase()
+        self.log = Mock()
+        self.now = datetime.now(timezone.utc)
+        self.verified = SimpleNamespace(name="인증됨")
+        self.tier_role = SimpleNamespace(name="골드 2")
+        self.position_role = SimpleNamespace(name="타격대")
+        self.guild = SimpleNamespace(
+            id=100, name="발쫀잼", members={},
+            roles=[self.verified, self.tier_role, self.position_role],
+        )
+        self.guild.get_member = self.guild.members.get
+        self.patch = patch.dict(ns, {
+            "db": self.db, "log": self.log, "dm_broadcast_lock": asyncio.Lock(), "DM_BROADCAST_INTERVAL": 0,
+            "bot": SimpleNamespace(get_guild=lambda guild_id: self.guild if guild_id == 100 else None),
+        })
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def member(self, user_id, verified=True, bot=False, **fields):
+        member = SimpleNamespace(
+            id=user_id, name=f"user{user_id}", display_name=f"멤버{user_id}", bot=bot, guild=self.guild,
+            roles=[self.verified] if verified else [], send=AsyncMock(),
+            add_roles=AsyncMock(), remove_roles=AsyncMock(), edit=AsyncMock(),
+        )
+        self.guild.members[user_id] = member
+        self.db.documents[f"users/{user_id}"] = {
+            "name": f"이름{user_id}", "tier": "골드 2", "riot_id": "test#kr1", **fields,
+        }
+        return member
+
+    def days_ago(self, days):
+        return self.now - timedelta(days=days)
+
+    def targets(self, days=60, respect_sent=False):
+        users = ns["list_registered_users"]()
+        found = ns["profile_check_targets"](self.guild, users, days, self.now, respect_sent)
+        return [member.id for member, _ in found]
+
+    def call(self, user=None):
+        call = interaction()
+        call.guild = self.guild
+        if user is not None:
+            call.user = user
+        return call
+
+    def button(self, action, guild_id=100):
+        return ns["ProfileCheckButton"](action, guild_id)
+
+    def dm_call(self, member):
+        """DM에서 누른 버튼: interaction.guild가 없고 user는 서버 멤버가 아님."""
+        call = interaction(user_id=member.id)
+        call.guild = None
+        return call
+
+    def test_targets_are_verified_registered_members_of_this_server_only(self):
+        self.member(1)
+        self.member(2, profile_checked_at=self.days_ago(61))
+        self.member(3, profile_checked_at=self.days_ago(10))
+        self.member(4, verified=False)
+        self.member(5, bot=True)
+        self.member(6, name="")
+        self.db.documents["users/7"] = {"name": "서버에 없는 사람"}
+        self.db.documents["users/not-a-number"] = {"name": "잘못된 ID"}
+        self.assertEqual(self.targets(), [1, 2])
+
+    def test_sent_time_only_limits_automatic_sending(self):
+        self.member(1, profile_check_sent_at=self.days_ago(10))
+        self.member(2, profile_check_sent_at=self.days_ago(61), profile_checked_at=self.days_ago(90))
+        self.assertEqual(self.targets(respect_sent=False), [1, 2])
+        self.assertEqual(self.targets(respect_sent=True), [2])
+
+    async def test_profile_save_marks_checked_but_internal_tier_does_not(self):
+        member = self.member(1)
+        self.assertTrue(await ns["save_user_profile"](member, {"tier": "골드 2"}))
+        self.assertIn("profile_checked_at", self.db.documents["users/1"])
+
+        other = self.member(2)
+        other.display_name = "다른멤버"
+        call = self.call()
+        with patch.dict(ns, {"block_if_not_in_guild": AsyncMock(return_value=False)}):
+            await ns["update_internal_tier"](call, other, "3상")
+        self.assertEqual(self.db.documents["users/2"]["internal_tier"], "3상")
+        self.assertNotIn("profile_checked_at", self.db.documents["users/2"])
+
+    async def test_preview_sends_real_dm_only_to_requester_without_marking(self):
+        requester = self.member(42)
+        other = self.member(1)
+        call = self.call(requester)
+        await ns["profile_check_command"](call, 60, True)
+        requester.send.assert_awaited_once()
+        other.send.assert_not_awaited()
+        self.assertEqual(len(requester.send.call_args.kwargs["view"].children), 3)
+        kwargs = call.followup.send.call_args.kwargs
+        self.assertIn("대상 2명", kwargs["content"])
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertNotIn("profile_check_sent_at", self.db.documents["users/42"])
+
+    async def test_preview_still_shows_when_requester_blocks_dm(self):
+        requester = self.member(42)
+        requester.send.side_effect = http_error(discord.Forbidden, 403)
+        call = self.call(requester)
+        await ns["profile_check_command"](call, 60, True)
+        self.assertIn("DM이 막혀", call.followup.send.call_args.kwargs["content"])
+        self.assertIsNotNone(call.followup.send.call_args.kwargs["embed"])
+
+    async def test_command_asks_before_sending_and_handles_no_targets(self):
+        member = self.member(1)
+        call = self.call()
+        await ns["profile_check_command"](call)
+        self.assertIn("1명", call.followup.send.call_args.args[0])
+        self.assertIsInstance(call.followup.send.call_args.kwargs["view"], ns["ProfileCheckConfirmView"])
+        member.send.assert_not_awaited()
+
+        self.db.documents["users/1"]["profile_checked_at"] = self.days_ago(1)
+        call = self.call()
+        await ns["profile_check_command"](call)
+        self.assertIn("대상이 없어요", call.followup.send.call_args.args[0])
+        self.assertNotIn("view", call.followup.send.call_args.kwargs)
+
+    async def test_confirm_sends_and_reports_failed_names_and_marks_attempts(self):
+        blocked = self.member(1)
+        blocked.send.side_effect = http_error(discord.Forbidden, 403)
+        ok = self.member(2)
+        replied = self.member(3)
+        view = ns["ProfileCheckConfirmView"](self.guild, 60)
+        self.db.documents["users/3"]["profile_checked_at"] = self.now  # 확인 화면이 뜬 뒤에 답한 사람
+        call = self.call()
+        await view.confirm.callback(call)
+
+        ok.send.assert_awaited_once()
+        replied.send.assert_not_awaited()
+        embed = ok.send.call_args.kwargs["embed"]
+        self.assertEqual(embed.fields[0].value, "골드 2")
+        self.assertEqual(embed.footer.text, "발쫀잼 공지")
+        self.assertIn("보냄: 1명", call.edit_original_response.call_args.kwargs["content"])
+        self.assertIn("멤버1", call.followup.send.call_args.args[0])
+        self.assertIn("profile_check_sent_at", self.db.documents["users/1"])
+        self.assertIn("profile_check_sent_at", self.db.documents["users/2"])
+        self.assertNotIn("profile_checked_at", self.db.documents["users/2"])
+
+    async def test_button_custom_id_survives_restart_with_server_id(self):
+        button = self.button("tier")
+        self.assertEqual(button.item.custom_id, "profile_check:tier:100")
+        match = ns["ProfileCheckButton"].__discord_ui_compiled_template__.fullmatch(button.item.custom_id)
+        restored = await ns["ProfileCheckButton"].from_custom_id(None, button.item, match)
+        self.assertEqual((restored.action, restored.guild_id), ("tier", 100))
+
+    async def test_keep_button_in_dm_marks_checked_and_removes_buttons(self):
+        member = self.member(1)
+        call = self.dm_call(member)
+        await self.button("keep").callback(call)
+        self.assertIn("profile_checked_at", self.db.documents["users/1"])
+        self.assertIn("확인했어요", call.edit_original_response.call_args.kwargs["content"])
+        self.assertIsNone(call.edit_original_response.call_args.kwargs["view"])
+
+    async def test_tier_button_in_dm_applies_roles_through_member_server(self):
+        member = self.member(1)
+        call = self.dm_call(member)
+        await self.button("tier").callback(call)
+        view = call.response.send_message.call_args.kwargs["view"]
+        self.assertIsInstance(view, ns["RoleSelectView"])
+
+        view.major_tier, view.division, view.selected_roles = "골드", "2", ["타격대"]
+        confirm = next(child for child in view.children if isinstance(child, discord.ui.Button))
+        confirm_call = self.dm_call(member)
+        await confirm.callback(confirm_call)
+        member.add_roles.assert_awaited_once_with(self.tier_role, self.position_role)
+        self.assertIn("profile_checked_at", self.db.documents["users/1"])
+
+    async def test_nickname_button_in_dm_opens_prefilled_modal(self):
+        member = self.member(1, student_id="21")
+        call = self.dm_call(member)
+        await self.button("nickname").callback(call)
+        modal = call.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, ns["NicknameModal"])
+        self.assertEqual(modal.riot_id.default, "test#kr1")
+        self.assertIs(modal.target, member)
+
+    async def test_buttons_refuse_left_or_unverified_member(self):
+        call = interaction(user_id=999)
+        await self.button("keep").callback(call)
+        self.assertIn("찾지 못했어요", call.response.send_message.call_args.args[0])
+
+        unverified = self.member(1, verified=False)
+        call = self.dm_call(unverified)
+        await self.button("tier").callback(call)
+        self.assertIn("/기본설정", call.response.send_message.call_args.args[0])
+        self.assertNotIn("profile_checked_at", self.db.documents["users/1"])
+
+    async def test_auto_setting_defaults_keeps_days_and_shows_next_targets(self):
+        self.member(1)
+        call = self.call()
+        await ns["configure_profile_check"](call)
+        self.assertIn("꺼짐", call.followup.send.call_args.args[0])
+        self.assertNotIn("guild_settings/100", self.db.documents)
+
+        call = self.call()
+        await ns["configure_profile_check"](call, True, 30)
+        settings = self.db.documents["guild_settings/100"]
+        self.assertEqual(
+            (settings["profile_check_auto_enabled"], settings["profile_check_days"], settings["profile_check_report_to"]),
+            (True, 30, "42"),
+        )
+        message = call.followup.send.call_args.args[0]
+        self.assertIn("켜짐", message)
+        self.assertIn("오후 8시", message)
+        self.assertIn("**1명**", message)
+
+        call = self.call()
+        await ns["configure_profile_check"](call, False)
+        self.assertFalse(self.db.documents["guild_settings/100"]["profile_check_auto_enabled"])
+        self.assertEqual(self.db.documents["guild_settings/100"]["profile_check_days"], 30)
+        self.assertIn("꺼짐", call.followup.send.call_args.args[0])
+
+    def enable_auto(self, days=60, report_to="42"):
+        self.db.documents["guild_settings/100"] = {
+            "profile_check_auto_enabled": True, "profile_check_days": days, "profile_check_report_to": report_to,
+        }
+
+    async def test_auto_does_nothing_when_off_or_never_configured(self):
+        member = self.member(1)
+        await ns["run_profile_check_auto"](self.guild)
+        self.db.documents["guild_settings/100"] = {"profile_check_auto_enabled": False}
+        await ns["run_profile_check_auto"](self.guild)
+        member.send.assert_not_awaited()
+
+    async def test_auto_sends_to_due_members_and_reports_to_admin(self):
+        admin = self.member(42, profile_checked_at=self.now)
+        blocked = self.member(1)
+        blocked.send.side_effect = http_error(discord.Forbidden, 403)
+        ok = self.member(2)
+        recently_sent = self.member(3, profile_check_sent_at=self.days_ago(5))
+        self.enable_auto()
+        await ns["run_profile_check_auto"](self.guild)
+
+        ok.send.assert_awaited_once()
+        recently_sent.send.assert_not_awaited()
+        report = admin.send.call_args.args[0]
+        self.assertIn("보냄: 1명", report)
+        self.assertIn("멤버1", report)
+
+    async def test_auto_second_run_does_not_message_unanswered_members_again(self):
+        self.member(42, profile_checked_at=self.now)
+        member = self.member(1)
+        self.enable_auto()
+        await ns["run_profile_check_auto"](self.guild)
+        self.db.documents["users/1"]["profile_check_sent_at"] = self.now  # 서버 시각 저장값 대신 실제 시각
+        await ns["run_profile_check_auto"](self.guild)
+        member.send.assert_awaited_once()
+
+    async def test_turning_auto_off_during_sending_stops_remaining_members(self):
+        admin = self.member(42, profile_checked_at=self.now)
+        first = self.member(1)
+        second = self.member(2)
+        self.enable_auto()
+
+        async def turn_off(**kwargs):
+            self.db.documents["guild_settings/100"]["profile_check_auto_enabled"] = False
+
+        first.send.side_effect = turn_off
+        await ns["run_profile_check_auto"](self.guild)
+        first.send.assert_awaited_once()
+        second.send.assert_not_awaited()
+        self.assertIn("1명에게는 보내지 않았어요", admin.send.call_args.args[0])
+        self.assertNotIn("profile_check_sent_at", self.db.documents["users/2"])
+
+    async def test_broadcast_and_profile_check_share_one_lock(self):
+        self.member(1)
+        call = self.call()
+        async with ns["dm_broadcast_lock"]:
+            await ns["ProfileCheckConfirmView"](self.guild, 60).confirm.callback(call)
+        self.assertIn("이미 다른 일괄 DM", call.response.edit_message.call_args.kwargs["content"])
+        self.guild.members[1].send.assert_not_awaited()
 
 
 if __name__ == "__main__":

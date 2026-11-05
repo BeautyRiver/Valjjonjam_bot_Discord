@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 # 로깅 설정 (실패 원인을 콘솔에 자세히 남김)
 logging.basicConfig(
@@ -241,6 +241,9 @@ async def on_ready():
         bot.add_view(EventView())
         bot.event_view_registered = True
         await refresh_event_messages()
+    if not getattr(bot, "profile_check_button_registered", False):
+        bot.add_dynamic_items(ProfileCheckButton)
+        bot.profile_check_button_registered = True
     if not getattr(bot, "toolkit_recruitments_backfilled", False):
         if await backfill_toolkit_recruitments():
             bot.toolkit_recruitments_backfilled = True
@@ -248,6 +251,8 @@ async def on_ready():
         cleanup_parties.start()
     if not close_started_events.is_running():
         close_started_events.start()
+    if not profile_check_auto_loop.is_running():
+        profile_check_auto_loop.start()
     await bot.tree.sync()
     print(f"{bot.user} 온라인!")
 
@@ -407,6 +412,8 @@ async def save_user_profile(member, fields):
                 "username": member.name,
                 **fields,
                 "updated_at": firestore.SERVER_TIMESTAMP,
+                # 정보 확인 안내 기준 — 관리자가 내부 티어만 바꿀 때도 갱신되는 updated_at과 구분
+                "profile_checked_at": firestore.SERVER_TIMESTAMP,
             },
             merge=True,
         )
@@ -434,7 +441,9 @@ class ConfirmButton(discord.ui.Button):
         await interaction.response.send_message("⏳ 적용 중...", ephemeral=True)
         member = view.target or interaction.user  # 관리자가 대신 설정 시 대상 멤버
 
-        role_failed = await apply_tier_roles(interaction.guild, member, tier, view.selected_roles)
+        # 정보 확인 DM의 버튼에서 열면 interaction.guild가 없어 대상 멤버의 서버를 사용
+        guild = interaction.guild or member.guild
+        role_failed = await apply_tier_roles(guild, member, tier, view.selected_roles)
         saved = await save_user_profile(
             member,
             {"nickname": member.display_name, "tier": tier, "role": view.selected_roles},
@@ -623,34 +632,49 @@ async def send_dm_broadcast(guild, embed):
     return sent, failed
 
 
-class DmBroadcastConfirmView(discord.ui.View):
-    """보내면 되돌릴 수 없는 전체 DM을 실행자에게 한 번 더 확인."""
+class DmSendConfirmView(discord.ui.View):
+    """보내면 되돌릴 수 없는 일괄 DM을 실행자에게 한 번 더 확인."""
 
-    def __init__(self, guild, embed):
+    cancel_message = "전송을 취소했어요."
+
+    def __init__(self):
         super().__init__(timeout=60)
-        self.guild = guild
-        self.embed = embed
+
+    async def send_all(self, interaction):
+        raise NotImplementedError
 
     @discord.ui.button(label="전송", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        # 관리자 두 명이 동시에 확인해 같은 사람에게 DM이 겹쳐 가지 않게 함
+        # 일괄 DM이 겹치면 같은 사람이 중복으로 받거나 스팸 제한에 걸릴 수 있음
         if dm_broadcast_lock.locked():
             await interaction.response.edit_message(
-                content="⚠️ 이미 다른 전체 안내를 보내는 중이에요. 끝난 뒤 다시 시도해주세요.", view=None
+                content="⚠️ 이미 다른 일괄 DM을 보내는 중이에요. 끝난 뒤 다시 시도해주세요.", view=None
             )
             return
         async with dm_broadcast_lock:
             await interaction.response.edit_message(content="⏳ DM을 보내는 중...", view=None)
-            sent, failed = await send_dm_broadcast(self.guild, self.embed)
-        await interaction.edit_original_response(
-            content=f"📣 전체 안내 DM 전송 완료!\n✅ 보냄: {sent}명 | ❌ 전송 실패(DM 차단 등): {failed}명"
-        )
+            await self.send_all(interaction)
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        await interaction.response.edit_message(content="전체 안내를 취소했어요.", view=None)
+        await interaction.response.edit_message(content=self.cancel_message, view=None)
+
+
+class DmBroadcastConfirmView(DmSendConfirmView):
+    cancel_message = "전체 안내를 취소했어요."
+
+    def __init__(self, guild, embed):
+        super().__init__()
+        self.guild = guild
+        self.embed = embed
+
+    async def send_all(self, interaction):
+        sent, failed = await send_dm_broadcast(self.guild, self.embed)
+        await interaction.edit_original_response(
+            content=f"📣 전체 안내 DM 전송 완료!\n✅ 보냄: {sent}명 | ❌ 전송 실패(DM 차단 등): {failed}명"
+        )
 
 
 @bot.tree.command(name="전체안내", description="봇을 제외한 서버 멤버 전원에게 입력한 내용을 DM으로 보냅니다")
@@ -713,17 +737,24 @@ async def announce_unverified(interaction: discord.Interaction):
     )
 
 
-async def send_ephemeral_log(interaction, title, lines):
-    """Discord 2,000자 제한에 맞춰 비공개 로그를 나눠 보냄."""
+async def send_split_lines(send, title, lines):
+    """Discord 2,000자 제한에 맞춰 여러 줄을 나눠 보냄."""
     message = title
     for line in lines:
         next_message = f"{message}\n{line}"
         if len(next_message) <= 1900:
             message = next_message
             continue
-        await interaction.followup.send(message, ephemeral=True)
+        await send(message)
         message = f"{title} **(계속)**\n{line}"
-    await interaction.followup.send(message, ephemeral=True)
+    await send(message)
+
+
+async def send_ephemeral_log(interaction, title, lines):
+    async def send(message):
+        await interaction.followup.send(message, ephemeral=True)
+
+    await send_split_lines(send, title, lines)
 
 
 @bot.tree.command(name="탈퇴정리", description="서버에 없는 멤버를 확인해 DB에서 삭제하고 명단을 알려줍니다")
@@ -1053,6 +1084,313 @@ async def admin_change_nickname(interaction: discord.Interaction, 대상: discor
         data.get("name", ""),
         data.get("riot_id", ""),
     ))
+
+
+# ===== 정보 확인 안내 =====
+# 티어·닉네임을 오래 확인하지 않은 멤버에게 DM으로 확인을 요청. 바뀌었으면 DM 버튼으로 바로 수정.
+
+PROFILE_CHECK_DEFAULT_DAYS = 60
+PROFILE_CHECK_AUTO_TIME = time(hour=20, tzinfo=PARTY_TIMEZONE)
+PROFILE_CHECK_BUTTONS = {
+    "keep": ("그대로예요", "✅", discord.ButtonStyle.green),
+    "tier": ("티어 변경", "🎯", discord.ButtonStyle.secondary),
+    "nickname": ("닉네임 변경", "✏️", discord.ButtonStyle.secondary),
+}
+
+
+def list_registered_users():
+    return {document.id: document.to_dict() or {} for document in db.collection("users").stream()}
+
+
+def get_guild_settings(guild_id):
+    snapshot = db.collection(GUILD_SETTINGS_COLLECTION).document(str(guild_id)).get()
+    return (snapshot.to_dict() or {}) if snapshot.exists else {}
+
+
+# respect_sent: 자동 발송용 — 답하지 않은 사람도 기준일이 다시 지나야 또 받음
+def profile_check_due(data, days, now, respect_sent=False):
+    times = [as_utc(data.get("profile_checked_at"))]
+    if respect_sent:
+        times.append(as_utc(data.get("profile_check_sent_at")))
+    times = [value for value in times if value is not None]
+    return not times or now - max(times) >= timedelta(days=days)
+
+
+# 현재 서버의 인증된 등록 멤버만 대상 (users는 서버 구분이 없는 공용 컬렉션, 미인증자는 /미인증안내 대상)
+def profile_check_targets(guild, users, days, now, respect_sent=False):
+    targets = []
+    for user_id, data in users.items():
+        member = guild.get_member(int(user_id)) if user_id.isdigit() else None
+        if member is None or member.bot or not is_verified(member) or not data.get("name"):
+            continue
+        if profile_check_due(data, days, now, respect_sent):
+            targets.append((member, data))
+    return targets
+
+
+def build_profile_check_embed(guild, data):
+    embed = discord.Embed(
+        title="📋 내 정보 확인",
+        description="등록된 정보가 지금도 맞는지 확인해주세요!\n바뀐 내용이 있으면 아래 버튼으로 바로 수정할 수 있어요.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="최대 티어", value=escape_display_text(data.get("tier")) or "미등록")
+    embed.add_field(name="발로란트 ID", value=escape_display_text(data.get("riot_id")) or "미등록")
+    embed.set_footer(text=f"{guild.name} 공지")
+    return embed
+
+
+# DM에는 서버 정보가 없으니 custom_id에 서버 ID를 담음. 재시작 후에도 동작하도록 on_ready에서 등록
+class ProfileCheckButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"profile_check:(?P<action>keep|tier|nickname):(?P<guild_id>[0-9]+)",
+):
+    def __init__(self, action, guild_id):
+        label, emoji, style = PROFILE_CHECK_BUTTONS[action]
+        super().__init__(discord.ui.Button(
+            label=label, emoji=emoji, style=style, custom_id=f"profile_check:{action}:{guild_id}"
+        ))
+        self.action = action
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["action"], int(match["guild_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = bot.get_guild(self.guild_id)
+        member = guild.get_member(interaction.user.id) if guild else None
+        if member is None:
+            await interaction.response.send_message(
+                "❌ 서버에서 멤버 정보를 찾지 못했어요. 서버에 계속 있는지 확인해주세요.", ephemeral=True
+            )
+            return
+        if not is_verified(member):
+            await interaction.response.send_message(
+                "🔒 먼저 서버에서 `/기본설정` 으로 등록을 완료해주세요!", ephemeral=True
+            )
+            return
+
+        if self.action == "tier":
+            await interaction.response.send_message(
+                "아래에서 역할군과 티어를 선택해주세요!", view=RoleSelectView(member), ephemeral=True
+            )
+            return
+        if self.action == "nickname":
+            data = await asyncio.to_thread(get_user_data, member.id)
+            await interaction.response.send_modal(NicknameModal(
+                member,
+                data.get("student_id", ""),
+                data.get("name", ""),
+                data.get("riot_id", ""),
+            ))
+            return
+
+        await interaction.response.defer()
+        if await save_user_profile(member, {}):
+            await interaction.edit_original_response(content="✅ 확인했어요! 감사합니다.", view=None)
+        else:
+            await interaction.followup.send(DB_SAVE_FAILED_NOTICE.strip(), ephemeral=True)
+
+
+def profile_check_view(guild_id):
+    view = discord.ui.View(timeout=None)
+    for action in PROFILE_CHECK_BUTTONS:
+        view.add_item(ProfileCheckButton(action, guild_id))
+    return view
+
+
+async def mark_profile_check_sent(user_id):
+    try:
+        await asyncio.to_thread(
+            db.collection("users").document(str(user_id)).set,
+            {"profile_check_sent_at": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+    except Exception:
+        log.exception("정보 확인 안내 발송 시각 저장 실패 — user=%s", user_id)
+
+
+# should_continue: 자동 발송 중 꺼졌는지 확인 — 꺼지면 남은 사람에게는 보내지 않음
+# 반환: (보낸 수, 실패 명단, 보내지 않은 수)
+async def send_profile_checks(guild, targets, should_continue=None):
+    sent, failed_names = 0, []
+    for index, (member, data) in enumerate(targets):
+        if should_continue is not None and not await should_continue():
+            return sent, failed_names, len(targets) - index
+        try:
+            await member.send(embed=build_profile_check_embed(guild, data), view=profile_check_view(guild.id))
+            sent += 1
+        except discord.HTTPException as e:
+            failed_names.append(escape_display_text(member.display_name))
+            log.warning("정보 확인 안내 DM 실패 — user=%s status=%s", member.id, e.status)
+        # DM을 막아 둔 사람에게 매일 다시 시도하지 않도록 실패해도 발송 시각을 남김
+        await mark_profile_check_sent(member.id)
+        await asyncio.sleep(DM_BROADCAST_INTERVAL)
+    return sent, failed_names, 0
+
+
+def profile_check_summary(sent, failed_names):
+    return f"✅ 보냄: {sent}명 | ❌ 전송 실패(DM 차단 등): {len(failed_names)}명"
+
+
+class ProfileCheckConfirmView(DmSendConfirmView):
+    cancel_message = "정보 확인 안내를 취소했어요."
+
+    def __init__(self, guild, days):
+        super().__init__()
+        self.guild = guild
+        self.days = days
+
+    async def send_all(self, interaction):
+        # 확인을 누르기 전에 답한 사람이 빠지도록 대상을 다시 계산
+        try:
+            users = await asyncio.to_thread(list_registered_users)
+        except Exception:
+            log.exception("정보 확인 안내 대상 조회 실패")
+            await interaction.edit_original_response(
+                content="❌ 멤버 정보를 불러오지 못해 보내지 않았어요. 잠시 후 다시 시도해주세요."
+            )
+            return
+        targets = profile_check_targets(self.guild, users, self.days, utc_now())
+        sent, failed_names, _ = await send_profile_checks(self.guild, targets)
+        await interaction.edit_original_response(
+            content=f"📣 정보 확인 안내 DM 전송 완료!\n{profile_check_summary(sent, failed_names)}"
+        )
+        if failed_names:
+            await send_ephemeral_log(
+                interaction, "❌ **DM을 받지 못한 멤버**", [f"• {name}" for name in failed_names]
+            )
+
+
+@bot.tree.command(name="정보확인안내", description="티어·닉네임을 오래 확인하지 않은 멤버에게 확인 DM을 보냅니다")
+@app_commands.describe(
+    기준일=f"이 일수 이상 확인하지 않은 멤버에게 보내요 (기본 {PROFILE_CHECK_DEFAULT_DAYS}일)",
+    미리보기="True면 내 DM으로만 보내요 (전송 전 확인용)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def profile_check_command(
+    interaction: discord.Interaction,
+    기준일: app_commands.Range[int, 1, 365] = PROFILE_CHECK_DEFAULT_DAYS,
+    미리보기: bool = False,
+):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    users = await asyncio.to_thread(list_registered_users)
+    count = len(profile_check_targets(guild, users, 기준일, utc_now()))
+
+    # 미리보기: 버튼까지 직접 눌러볼 수 있게 실제 DM을 나에게만 보냄 (발송 시각은 남기지 않음)
+    if 미리보기:
+        embed = build_profile_check_embed(guild, users.get(str(interaction.user.id), {}))
+        try:
+            await interaction.user.send(embed=embed, view=profile_check_view(guild.id))
+            note = "내 DM으로 실제 메시지를 보냈어요. 버튼도 눌러볼 수 있어요."
+        except discord.HTTPException:
+            note = "내 DM이 막혀 있어 여기에만 보여드려요."
+        await interaction.followup.send(
+            content=f"🧪 **미리보기** — 다른 멤버에게는 보내지 않았어요! (기준 {기준일}일, 대상 {count}명)\n{note}",
+            embed=embed, ephemeral=True,
+        )
+        return
+
+    if not count:
+        await interaction.followup.send(f"✅ {기준일}일 기준으로 보낼 대상이 없어요.", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"📨 {기준일}일 이상 정보를 확인하지 않은 멤버 **{count}명**에게 확인 DM을 보낼까요?\n"
+        "보낸 DM은 되돌릴 수 없어요.",
+        view=ProfileCheckConfirmView(guild, 기준일), ephemeral=True,
+    )
+
+
+@bot.tree.command(name="정보확인자동설정", description="정보 확인 DM 자동 발송을 켜거나 끄고 기준일을 바꿉니다")
+@app_commands.describe(
+    사용="자동 발송 켜기/끄기 (비워두면 그대로)",
+    기준일="이 일수가 지나면 다시 보내요 (비워두면 그대로)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configure_profile_check(
+    interaction: discord.Interaction,
+    사용: bool = None,
+    기준일: app_commands.Range[int, 1, 365] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    settings = await asyncio.to_thread(get_guild_settings, guild.id)
+    enabled = bool(settings.get("profile_check_auto_enabled")) if 사용 is None else 사용
+    days = 기준일 or settings.get("profile_check_days") or PROFILE_CHECK_DEFAULT_DAYS
+
+    # 옵션 없이 실행하면 현재 설정만 보여줌
+    if 사용 is not None or 기준일 is not None:
+        await asyncio.to_thread(
+            db.collection(GUILD_SETTINGS_COLLECTION).document(str(guild.id)).set,
+            {
+                "profile_check_auto_enabled": enabled,
+                "profile_check_days": days,
+                "profile_check_report_to": str(interaction.user.id),
+                "updated_by": str(interaction.user.id),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+    if not enabled:
+        await interaction.followup.send(
+            f"⚪ 정보 확인 자동 발송: **꺼짐** (기준 {days}일)\n"
+            "보내는 중이었다면 아직 받지 않은 멤버에게는 보내지 않아요.",
+            ephemeral=True,
+        )
+        return
+
+    users = await asyncio.to_thread(list_registered_users)
+    count = len(profile_check_targets(guild, users, days, utc_now(), respect_sent=True))
+    await interaction.followup.send(
+        f"🟢 정보 확인 자동 발송: **켜짐** (기준 {days}일)\n"
+        f"매일 오후 {PROFILE_CHECK_AUTO_TIME.hour - 12}시(한국 시간)에 대상자에게 DM을 보내요. "
+        f"지금 기준 다음 발송 대상은 **{count}명**이에요.\n"
+        "결과와 실패 명단은 이 설정을 마지막으로 바꾼 관리자에게 DM으로 알려드려요.",
+        ephemeral=True,
+    )
+
+
+async def report_profile_check_auto(guild, report_to, sent, failed_names, skipped):
+    admin = guild.get_member(int(report_to)) if str(report_to or "").isdigit() else None
+    if admin is None:
+        log.warning("정보 확인 자동 안내 결과를 받을 관리자 없음 — guild=%s", guild.id)
+        return
+    title = f"📣 **{guild.name}** 정보 확인 자동 안내 결과\n{profile_check_summary(sent, failed_names)}"
+    if skipped:
+        title += f"\n⏹️ 자동 발송이 꺼져 {skipped}명에게는 보내지 않았어요."
+    try:
+        await send_split_lines(admin.send, title, [f"• {name}" for name in failed_names])
+    except discord.HTTPException:
+        log.warning("정보 확인 자동 안내 결과 DM 실패 — admin=%s", admin.id)
+
+
+async def run_profile_check_auto(guild):
+    settings = await asyncio.to_thread(get_guild_settings, guild.id)
+    if not settings.get("profile_check_auto_enabled"):
+        return
+    days = settings.get("profile_check_days") or PROFILE_CHECK_DEFAULT_DAYS
+
+    async def still_enabled():
+        try:
+            current = await asyncio.to_thread(get_guild_settings, guild.id)
+        except Exception:
+            log.exception("정보 확인 자동 설정 조회 실패 — guild=%s", guild.id)
+            return False
+        return bool(current.get("profile_check_auto_enabled"))
+
+    async with dm_broadcast_lock:
+        users = await asyncio.to_thread(list_registered_users)
+        targets = profile_check_targets(guild, users, days, utc_now(), respect_sent=True)
+        if not targets:
+            return
+        sent, failed_names, skipped = await send_profile_checks(guild, targets, still_enabled)
+    await report_profile_check_auto(guild, settings.get("profile_check_report_to"), sent, failed_names, skipped)
 
 
 # ===== 파티 모집 =====
@@ -3709,6 +4047,20 @@ async def close_started_events():
             log.error("이벤트 자동 마감 권한 없음 — event=%s", event_id)
         except Exception:
             log.exception("이벤트 자동 마감 실패 — event=%s", event_id)
+
+
+@tasks.loop(time=PROFILE_CHECK_AUTO_TIME)
+async def profile_check_auto_loop():
+    for guild in bot.guilds:
+        try:
+            await run_profile_check_auto(guild)
+        except Exception:
+            log.exception("정보 확인 자동 안내 실패 — guild=%s", guild.id)
+
+
+@profile_check_auto_loop.before_loop
+async def before_profile_check_auto_loop():
+    await bot.wait_until_ready()
 
 
 @cleanup_parties.before_loop

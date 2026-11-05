@@ -1,6 +1,6 @@
 # 발쫀봇 프로젝트 인수인계
 
-작성 기준: 2026-11-05. 구현 기준 커밋: `2862a73` 이후 `/전체안내` 추가.
+작성 기준: 2026-11-05. 구현 기준 커밋: `20ba155` 이후 정보 확인 안내 추가.
 다른 AI에 이 파일을 먼저 전달하면 됩니다. 설명이 코드와 다르면 현재 코드·Git 이력을 확인하고 차이를 알리세요.
 이 문서는 운영 서버의 실제 배포 버전을 보장하지 않습니다.
 
@@ -28,6 +28,7 @@
 | --- | --- |
 | 로그인·시작 작업 | 파일 상단 Firebase 초기화, `on_ready`, 파일 끝 `bot.run` |
 | 멤버 등록·인증 | `BasicSetupModal`, `BasicSetupView`, `TierRoleView`, `VERIFIED_ROLE`, `apply_tier_roles`, `apply_nickname`, `save_user_profile` |
+| 정보 확인 안내 | `profile_check_targets`, `ProfileCheckButton`, `send_profile_checks`, `profile_check_command`, `configure_profile_check`, `run_profile_check_auto`, `profile_check_auto_loop` |
 | 내부 티어 | `INTERNAL_TIER_LABELS`, `INTERNAL_TIER_SCORES`, `set_internal_tier`, `update_internal_tier` |
 | 일반 파티 | `PartyView`, `PartyCreationView`, `PartyTimeEditView`, `join_party_transaction`, `leave_party_transaction`, `DeleteConfirmView` |
 | 이벤트·티어 제한 | `EventFeeSelectionView`, `EventDetailsModal`, `EventCreationView`, `EventView`, `EventMemberRemoveView`, `event_tier_*` |
@@ -41,6 +42,7 @@
 `on_ready`는 영구 View 등록, 기존 모집글 갱신, 공개 미러 백필, 정리 루프 시작, 명령어 sync를 수행합니다.
 재시작 후 기존 메시지 버튼이 작동해야 하므로 `custom_id`와 persistent View 동작을 보존하세요.
 고정 `custom_id`: `party:join|leave|change_time|delete`, `event:join|leave|members|close|reopen|delete|remove_member`.
+정보 확인 DM 버튼은 서버 ID를 담는 동적 `custom_id` `profile_check:keep|tier|nickname:{guildId}`이며 `on_ready`의 `add_dynamic_items`로 복원합니다. 이미 보낸 DM의 버튼이 동작해야 하므로 형식을 보존하세요.
 
 ## 3. 현재 기능과 유지해야 할 동작
 
@@ -55,6 +57,13 @@
 - `/역할생성`, `/메세지`, `/미인증안내`, `/탈퇴정리`: 운영 명령어. 권한 검사와 실제 부작용을 읽고 사용하세요. `/미인증안내`는 일부 DM 전송이 실패해도 나머지 멤버에게 계속 보내고 실패 수를 보고합니다.
 - `/메세지`는 명령어를 친 채널에 임베드를 보냅니다. 보내기 전에 제목 256자·내용 4,096자 제한과 그 채널의 봇 권한(`interaction.app_permissions`: 채널 보기·메시지 보내기(스레드는 스레드에서 메시지 보내기)·링크 첨부)을 확인해 빠진 권한 이름을 비공개로 안내합니다. 먼저 응답(defer)한 뒤 전송하며, 그래도 Discord가 권한 오류를 돌려주면 확인할 권한을 안내합니다. `미리보기`는 권한과 관계없이 본인에게만 보여줍니다.
 - `/전체안내`: 관리자가 입력한 내용(`/메세지`와 같은 `build_notice_embed`)을 봇을 제외한 서버 멤버 전원에게 DM으로 보냅니다. 임베드 하단에 서버 이름을 표시합니다. `미리보기=True`는 본인에게만 보여주고, `False`면 받는 인원을 보여주는 확인 화면(`DmBroadcastConfirmView`, 60초)에서 `전송`을 눌러야 보냅니다. 스팸 제한을 피하려고 한 명당 1초(`DM_BROADCAST_INTERVAL`) 간격을 두며, 일부 DM이 실패해도 계속 보내고 실패 수를 보고합니다. `dm_broadcast_lock`으로 동시 전송을 막습니다. 완료 보고는 Discord 응답 제한(15분) 안에 끝나야 하므로 멤버가 약 800명을 넘으면 보고 방식을 다시 봐야 합니다.
+- 정보 확인 안내: 멤버가 티어·닉네임을 잘 안 고치는 문제를 줄이는 리마인더입니다. 대상은 현재 서버에 있는 봇이 아닌 **인증된 등록 멤버** 중 `profile_checked_at`이 기준일 이상 지났거나 없는 사람입니다(미인증자는 `/미인증안내` 몫). 필드가 없는 기존 멤버는 처음에 모두 대상입니다.
+  - DM에 현재 최대 티어·발로란트 ID와 `그대로예요`·`티어 변경`·`닉네임 변경` 버튼을 표시합니다. `그대로예요`는 확인 시각만 저장하고, 나머지는 `RoleSelectView`·`NicknameModal`을 DM에서 재사용합니다(역할군도 다시 선택). 슬래시 명령어와 달리 버튼은 DM에서도 동작하며, 서버를 나갔거나 미인증이면 안내만 합니다.
+  - `save_user_profile`을 거치는 저장(기본설정·역할설정·닉네임변경, 대리 포함, DM 버튼)이 `profile_checked_at`을 갱신합니다. 내부 티어 저장은 갱신하지 않으므로 `updated_at`을 이 기준으로 쓰지 마세요.
+  - `/정보확인안내`: 수동 발송. `기준일`(기본 60일, 1~365), `미리보기`. `미리보기=True`는 실행자 본인 DM으로만 실제 메시지를 보내고(DM이 막혀 있으면 비공개 표시) 발송 시각을 남기지 않습니다. `False`는 확인 화면에서 `전송`을 눌러야 보내며, 이때 대상을 다시 계산합니다. 실패한 멤버 이름을 실행자에게 비공개로 알려줍니다.
+  - `/정보확인자동설정`: 자동 발송 켜기·끄기(`사용`)와 `기준일` 변경. 옵션 없이 실행하면 현재 설정만 보여줍니다. **기본은 꺼짐이며 설정한 서버에서만 동작**합니다. 켜져 있으면 매일 오후 8시(KST, `PROFILE_CHECK_AUTO_TIME`)에 대상자에게 보내고, 결과와 실패 명단은 설정을 마지막으로 바꾼 관리자에게 DM으로 보냅니다. 봇이 그 시각에 꺼져 있었으면 다음 날 보냅니다.
+  - 자동 발송 대상은 `profile_check_sent_at`도 함께 봅니다. 답하지 않은 사람도 기준일이 다시 지나야 또 받으며, DM이 실패해도 발송 시각을 남겨 매일 재시도하지 않습니다. 수동 발송은 이 값을 무시하지만 값을 남기므로, 수동으로 보낸 사람에게 자동 DM이 바로 이어지지 않습니다. 보내는 중에 끄면 한 명 보내기 전마다 설정을 다시 읽어 남은 사람에게 보내지 않습니다(이미 보낸 DM은 되돌릴 수 없음). 처음 켜면 기존 멤버 전원이 대상입니다.
+  - `/전체안내`와 같은 `dm_broadcast_lock`·1초 간격을 씁니다. 수동 전송은 다른 일괄 DM이 진행 중이면 거절하고, 자동 발송은 끝날 때까지 기다립니다.
 - 모든 슬래시 명령어는 `allowed_contexts`로 **서버 안에서만** 노출됩니다. 권한 부족·그 밖의 명령어 오류는 `@bot.tree.error` 공통 처리기가 비공개로 안내하고 로그를 남깁니다. 명령어별 `.error` 처리기를 다시 추가하지 마세요(공통 처리기와 중복 응답).
 - `/닉네임변경`·`/대리닉네임변경`의 기존 정보 조회는 `asyncio.to_thread`로 실행합니다.
 - 새 멤버에게 기본설정 안내 DM을 보내고 실패 시 시스템 채널로 안내합니다. 역할이 없다는 이유로 자동 강퇴하지 않습니다.
@@ -97,8 +106,8 @@ Discord ID와 메시지 ID는 **문자열**로 저장·비교합니다. 시간�
 
 | 컬렉션 / 문서 ID | 주요 필드와 의미 |
 | --- | --- |
-| `users/{discordId}` | `discord_id`, `username`, `student_id`, `name`, `riot_id`, `tier`, `role`(배열), `internal_tier`, `nickname`(`/역할설정` 때 표시 이름), `updated_at` |
-| `guild_settings/{guildId}` | `party_channel_id`, `updated_by`, `updated_at` |
+| `users/{discordId}` | `discord_id`, `username`, `student_id`, `name`, `riot_id`, `tier`, `role`(배열), `internal_tier`, `nickname`(`/역할설정` 때 표시 이름), `updated_at`, `profile_checked_at`(본인·대리 정보 확인 시각), `profile_check_sent_at`(마지막 정보 확인 DM 시도 시각). 시각 두 개는 봇 전용이며 웹은 읽지 않습니다. |
+| `guild_settings/{guildId}` | `party_channel_id`, `profile_check_auto_enabled`, `profile_check_days`, `profile_check_report_to`, `updated_by`, `updated_at` |
 | `parties/{messageId}` | `name`, `creator_id`, `guild_id`, `channel_id`, `message_id`, `member_ids`, `waitlist_ids`, `max_members`(5/10), `preferred_tier`, `scheduled_at`, `delete_at`, `status`, 생성/수정 시각 |
 | `events/{messageId}` | 공통 모집 정보와 `member_ids`, `prize`, `has_entry_fee`, `entry_fee`, `bank_holder`, `account_number`, `rules`, `tier_restriction`, `scheduled_at`, `status`, 생성/수정 시각 |
 | `toolkit_recruitments/{party또는event}_{messageId}` | 팀 편성용 공개 미러. 원본 컬렉션과 함께 갱신/삭제합니다. |
@@ -144,7 +153,7 @@ git diff --check
 ```
 
 테스트는 `discord.py`가 필요합니다. AST로 허용한 정의만 가져오고 실제 Discord UI 클래스와 가짜 DB/응답으로 검사합니다. 토큰·서비스 계정 파일을 읽거나 운영 네트워크에 연결하지 않습니다.
-현재 회귀 테스트 49개는 이벤트 티어 조합·미등록·? 처리·transaction·참가비 양쪽 생성 흐름·비공개 참가 안내, 이벤트 10명 단위 확정·대기 표시·미러 분리, 기본설정·역할설정·닉네임변경의 역할·닉네임·DB 저장 실패 안내, 이벤트 조회 범위, 일반 파티 참가·대기·FIFO 승격·마감, 삭제 확인, 관리자 참가자 제외, 모집 채널 삭제 감지 캐시, 공통 명령어 오류 처리, 내부 티어 저장, `/메세지` 권한·글자 수 확인, `/전체안내` 미리보기·확인·전송 실패·동시 전송 차단을 다룹니다. 봇의 모든 기능을 검증하는 테스트는 아닙니다.
+현재 회귀 테스트 67개는 이벤트 티어 조합·미등록·? 처리·transaction·참가비 양쪽 생성 흐름·비공개 참가 안내, 이벤트 10명 단위 확정·대기 표시·미러 분리, 기본설정·역할설정·닉네임변경의 역할·닉네임·DB 저장 실패 안내, 이벤트 조회 범위, 일반 파티 참가·대기·FIFO 승격·마감, 삭제 확인, 관리자 참가자 제외, 모집 채널 삭제 감지 캐시, 공통 명령어 오류 처리, 내부 티어 저장, `/메세지` 권한·글자 수 확인, `/전체안내` 미리보기·확인·전송 실패·동시 전송 차단, 정보 확인 안내의 대상 선정·확인 시각 갱신·DM 버튼·자동 설정·자동 발송·발송 중 끄기를 다룹니다. 봇의 모든 기능을 검증하는 테스트는 아닙니다.
 
 패치 후에는 `bot-check` skill(Claude `/bot-check`, Codex는 `.agents/skills`에서 인식)로 위 검사를 한 번에 실행할 수 있습니다.
 `python .agents/skills/bot-check/scripts/bot_check.py [--base origin/main]`은 `bot.py`를 실행·import하지 않고 문법·`git diff --check`·회귀 테스트를 돌린 뒤, 공개 미러의 비밀 필드 누출, 내부 티어 점수·이름, `EVENT_TIER_MODES`, 컬렉션 이름, 고정 버튼 `custom_id`의 변경 전후와 웹 `INTERNAL_TIER_INFO` 점수 일치 여부를 보고합니다.
