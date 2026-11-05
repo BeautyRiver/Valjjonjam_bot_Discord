@@ -1131,7 +1131,7 @@ def profile_check_targets(guild, users, days, now, respect_sent=False):
 def build_profile_check_embed(guild, data):
     embed = discord.Embed(
         title="📋 내 정보 확인",
-        description="등록된 정보가 지금도 맞는지 확인해주세요!\n바뀐 내용이 있으면 아래 버튼으로 바로 수정할 수 있어요.",
+        description="안녕하세요! 지금 등록된 이 정보가 최신 정보가 맞나요?\n바뀐 내용이 있으면 아래 버튼으로 바로 수정할 수 있어요.",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="최대 티어", value=escape_display_text(data.get("tier")) or "미등록")
